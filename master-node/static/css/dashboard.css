@@ -1,0 +1,14 @@
+body { font-family: 'Tajawal', sans-serif; }
+.badge { display:inline-flex; align-items:center; gap:.25rem; padding:.15rem .5rem; border-radius:999px; font-size:.75rem; font-weight:700; white-space:nowrap; }
+.badge-video { color:rgb(34 211 238); background:rgba(34,211,238,.1); border:1px solid rgba(34,211,238,.25); }
+.badge-audio { color:rgb(192 132 252); background:rgba(192,132,252,.1); border:1px solid rgba(192,132,252,.25); }
+.badge-image { color:rgb(74 222 128); background:rgba(74,222,128,.1); border:1px solid rgba(74,222,128,.25); }
+.badge-document { color:rgb(96 165 250); background:rgba(96,165,250,.1); border:1px solid rgba(96,165,250,.25); }
+.badge-subtitle { color:rgb(250 204 21); background:rgba(250,204,21,.1); border:1px solid rgba(250,204,21,.25); }
+.badge-other { color:rgb(156 163 175); background:rgba(156,163,175,.1); border:1px solid rgba(156,163,175,.25); }
+.detail-row { display:grid; grid-template-columns:140px 1fr; gap:1rem; border-bottom:1px solid rgba(55,65,81,.6); padding-bottom:.75rem; }
+.detail-label { color:rgb(156 163 175); font-weight:700; }
+.detail-value { color:rgb(229 231 235); overflow-wrap:anywhere; }
+.action-btn { padding:.25rem .65rem; border-radius:.5rem; font-size:.75rem; font-weight:700; transition:.15s ease-in-out; }
+.action-btn-details { color:rgb(34 211 238); background:rgba(34,211,238,.08); border:1px solid rgba(34,211,238,.2); }
+.action-btn-details:hover { background:rgba(34,211,238,.18); }
