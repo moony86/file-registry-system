@@ -1,0 +1,358 @@
+FSYS v0.6.4 Bug Fix – Media Inspector Source of Truth + Collection Duplication
+
+المطلوب:
+فحص وتشخيص وإصلاح مشكلة Media Inspector / Media Review بعد v0.6.4.
+
+لا تضف Features جديدة.
+لا تعيد تصميم الواجهة.
+لا تغير Upload/Delete/Restore/Stream.
+لا تغير Storage Node.
+لا تضف AI أو scraping.
+لا تغير قاعدة البيانات جذرياً.
+المطلوب فقط: فحص السبب الجذري وإصلاحه بأقل تعديل آمن.
+
+==================================================
+السياق
+==================================================
+
+المشروع FSYS:
+Home Media Server + File Registry
+
+تم تنفيذ:
+- Media Drafts
+- Media Items
+- Media Collections
+- File Inspector داخل Details
+- Media Tab لتعديل بيانات العمل/الحلقة
+- Media Library
+
+المشكلة ظهرت بعد رفع حلقات أنمي وربطها بـ Collection.
+
+مثال ملف:
+[Witanime.com] YNT EP 01 FHD.mp4
+
+الـ API يرجع:
+
+media.draft موجود
+media.item موجود
+
+الـ draft قديم/جزئي.
+الـ item يحتوي البيانات الصحيحة.
+
+==================================================
+المشكلة الحالية
+==================================================
+
+في Inspector / Media Tab:
+
+- أحياناً تظهر الحقول كأنها unknown أو فاضية.
+- رغم أن media_item يحتوي بيانات صحيحة.
+- عند approved item، الواجهة لا تزال تعرض New Collection Title.
+- يوجد Collection مكرر:
+  Yofukashi no Uta (unknown)
+  Yofukashi no Uta (anime)
+
+مثال من JSON:
+
+draft:
+- review_status = approved
+- final_media_kind = anime_episode
+- suggested_media_kind = unknown
+- collection_id = null
+- collection_title = null
+- season = 1
+- season_number = null
+- episode_number = null
+
+item:
+- media_kind = anime_episode
+- collection_id = 2
+- collection_title = Yofukashi no Uta
+- collection_type = anime
+- season_number = 1
+- episode_number = 1
+- title = [Witanime com] YNT EP 01 FHD
+
+collections:
+- collection_id = 2, title = Yofukashi no Uta, type = anime
+- collection_id = 1, title = Yofukashi no Uta, type = unknown
+
+هذا يعني أن البيانات الصحيحة موجودة في media_item، لكن الواجهة أو API قد تعرض/تقرأ draft القديم.
+
+==================================================
+الهدف
+==================================================
+
+إصلاح Media Inspector بحيث:
+
+1. إذا media.item موجود:
+   يكون هو مصدر الحقيقة للعرض والتعديل.
+
+2. إذا media.item غير موجود وdraft pending:
+   يكون draft هو مصدر العرض والموافقة.
+
+3. إذا draft approved وله item:
+   لا تستخدم draft لملء حقول التعديل إلا للقراءة الثانوية/Debug.
+
+4. لا تظهر New Collection Title عندما الملف مرتبط بـ Collection موجودة إلا إذا ضغط المستخدم Create New أو Change Collection.
+
+5. لا تظهر unknown إذا item يحتوي قيمة صحيحة.
+
+6. منع أو تقليل تكرار Collections بنفس العنوان.
+
+==================================================
+المطلوب فحصه
+==================================================
+
+افحص الملفات التالية:
+
+- master-node/routes/media.py
+- master-node/database.py
+- master-node/static/js/dashboard.js
+- master-node/templates/dashboard.html
+
+لا تفحص المشروع كله إلا إذا احتجت.
+
+==================================================
+Trace مطلوب
+==================================================
+
+تتبع flow:
+
+GET /api/media/files/<file_id>
+↓
+dashboard.js
+↓
+renderMediaTab أو ما يعادلها
+↓
+form fields
+↓
+Save Changes / Approve
+↓
+PATCH /api/media/files/<file_id> أو approve endpoint
+↓
+DB update
+↓
+refresh
+↓
+render again
+
+حدد بالضبط:
+
+1. هل UI يستخدم item أم draft عندما الاثنين موجودين؟
+2. هل اختيار collection يأخذ collection_id الصحيح؟
+3. هل New Collection input يسبب إنشاء duplicate؟
+4. هل PATCH يحدث media_item الصحيح؟
+5. هل approve ينشئ collection مكررة؟
+6. هل library grouping يعتمد على collection_id أم title فقط؟
+
+==================================================
+قواعد الإصلاح
+==================================================
+
+## Rule 1: Source of Truth داخل Inspector
+
+إذا response يحتوي:
+
+media.item != null
+
+فالـ Media Tab يجب أن يقرأ من:
+
+media.item
+
+وليس:
+
+media.draft
+
+القيم التي يجب أن تأتي من item:
+- media_kind
+- collection_id
+- collection_title
+- collection_type
+- season_number
+- episode_number
+- title
+- year
+- language
+
+أما draft يستخدم فقط إذا:
+
+media.item == null
+
+==================================================
+
+## Rule 2: Pending Draft فقط
+
+إذا:
+
+media.item == null
+و
+media.draft.review_status == pending
+
+اعرض واجهة approve draft.
+
+==================================================
+
+## Rule 3: Approved Draft with Item
+
+إذا:
+
+draft.review_status == approved
+و
+item موجود
+
+اعرض:
+
+Mode: item
+
+ولا تعرض controls الخاصة بإنشاء draft جديد إلا إذا المستخدم يضغط edit/change.
+
+==================================================
+
+## Rule 4: Collection UI
+
+في حالة item موجود:
+
+اعرض:
+Current Collection:
+Yofukashi no Uta (anime)
+
+مع select لتغيير collection فقط.
+
+لا تعرض New Collection Title بشكل دائم.
+
+اجعل New Collection Title يظهر فقط إذا:
+- selected collection value = "__new__"
+أو المستخدم ضغط:
+Create New Collection
+
+==================================================
+
+## Rule 5: Duplicate Collections
+
+افحص منطق إنشاء collection.
+
+إذا المستخدم يرسل:
+title = Yofukashi no Uta
+collection_type = anime
+
+وكانت موجودة:
+Yofukashi no Uta + anime
+
+لا تنشئ نسخة جديدة.
+
+إذا كانت موجودة:
+Yofukashi no Uta + unknown
+
+وقام المستخدم بإنشاء:
+Yofukashi no Uta + anime
+
+هنا يوجد خياران:
+
+الخيار المقبول الآن:
+- اسمح بالفرق لأن type مختلف.
+- لكن في UI اعرض النوع بوضوح.
+
+الخيار الأفضل إن كان سهل:
+- عند إنشاء collection جديدة، إذا يوجد نفس title بنوع unknown، حدّثها إلى anime بدلاً من إنشاء واحدة جديدة.
+
+اختر الحل الأبسط والأكثر أماناً، واذكره في التقرير.
+
+==================================================
+إصلاح بيانات موجودة
+==================================================
+
+لا تحذف بيانات تلقائياً بدون وضوح.
+
+لكن يمكنك إضافة utility أو function صغيرة أو SQL suggestion لتنظيف التكرار:
+
+مثال:
+- إذا يوجد Yofukashi no Uta unknown غير مستخدمة، يمكن حذفها أو دمجها يدوياً.
+- إذا media_items تشير إلى collection_id=2 الصحيح، لا تلمسها.
+
+لا تنفذ cleanup destructive تلقائي إلا إذا كان آمناً جداً.
+
+==================================================
+اختبار القبول
+==================================================
+
+استخدم الحالة الحالية:
+
+EP 01:
+media_item موجود:
+collection_id = 2
+collection_title = Yofukashi no Uta
+collection_type = anime
+season_number = 1
+episode_number = 1
+media_kind = anime_episode
+
+المطلوب بعد الإصلاح:
+
+1. افتح Details → Media.
+2. يجب أن يظهر:
+   - Mode: item
+   - Media Kind: anime_episode
+   - Collection: Yofukashi no Uta (anime)
+   - Season: 1
+   - Episode: 1
+   - Title من item
+3. لا يظهر New Collection Title إلا إذا اخترت Create New.
+4. Refresh لا يرجع unknown.
+5. Save Changes يحفظ على media_item ولا ينشئ item جديد.
+6. EP 02 يعرض episode_number = 2 إذا كان item يحتويها.
+7. Media Library تعرض Yofukashi no Uta مرة واحدة بقدر الإمكان.
+8. تحتها Season 1 وفيه Episode 1 و Episode 2.
+
+==================================================
+اختبارات إضافية
+==================================================
+
+اختبر pending draft جديد:
+
+1. ارفع فيديو جديد.
+2. افتح Details → Media.
+3. لا يوجد item.
+4. يوجد draft pending.
+5. اعرض draft controls.
+6. اختر anime_episode.
+7. اختر collection موجودة.
+8. season/episode.
+9. Approve.
+10. بعد approve:
+    - item ينشأ.
+    - refresh يعرض Mode: item.
+    - القيم تبقى.
+
+==================================================
+ممنوع
+==================================================
+
+- لا تغير Stream.
+- لا تغير Upload.
+- لا تغير Delete/Restore.
+- لا تعيد تصميم Dashboard بالكامل.
+- لا تضف Viewer UI.
+- لا تضف AI.
+- لا تضف scraping.
+- لا تضف schema ضخم.
+- لا تنقل إلى SQLAlchemy.
+
+==================================================
+Output المطلوب
+==================================================
+
+بعد التنفيذ أعطني:
+
+1. السبب الجذري.
+2. هل المشكلة كانت UI يقرأ draft بدل item؟
+3. هل كانت collection duplication من create logic؟
+4. الملفات المعدلة.
+5. APIs المعدلة إن وجدت.
+6. هل أضفت أو عدلت DB functions؟
+7. كيف أختبر EP 01 و EP 02.
+8. أي cleanup يدوي مقترح للتكرار الموجود:
+   Yofukashi no Uta unknown
+   Yofukashi no Uta anime
+
+نفذ هذا كـ bug fix فقط.

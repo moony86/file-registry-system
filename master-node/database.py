@@ -16,6 +16,8 @@ Later, if request volume increases, replace _new_connection() with a small pool.
 
 import os
 import uuid
+import socket
+import re
 from contextlib import contextmanager
 from dotenv import load_dotenv
 import pg8000.native
@@ -23,6 +25,71 @@ import pg8000.native
 load_dotenv()
 
 NODE_TIMEOUT_SECONDS = int(os.getenv("NODE_TIMEOUT_SECONDS", "30"))
+
+MEDIA_KIND_VALUES = {
+    "movie",
+    "series_episode",
+    "anime_episode",
+    "youtube_video",
+    "short",
+    "course",
+    "clip",
+    "other_video",
+    "unknown",
+}
+
+REVIEW_STATUS_VALUES = {"pending", "approved", "rejected", "needs_edit"}
+
+COLLECTION_TYPE_VALUES = {
+    "anime",
+    "series",
+    "movie_collection",
+    "youtube_channel",
+    "course",
+    "clips",
+    "unknown",
+}
+
+
+def suggest_media_draft_from_filename(file_name):
+    stem = os.path.splitext(os.path.basename(file_name or ""))[0]
+    spaced = re.sub(r"[._\-]+", " ", stem)
+    spaced = re.sub(r"\s+", " ", spaced).strip()
+
+    season = None
+    episode = None
+    suggested_kind = "unknown"
+
+    episode_match = re.search(r"\bS(\d{1,2})E(\d{1,3})\b", spaced, flags=re.IGNORECASE)
+    if episode_match:
+        season = int(episode_match.group(1))
+        episode = int(episode_match.group(2))
+        suggested_kind = "series_episode"
+
+    year = None
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", spaced)
+    if year_match:
+        year = int(year_match.group(1))
+        if suggested_kind == "unknown":
+            suggested_kind = "movie"
+
+    ep_match = re.search(r"\bEP\s*(\d{1,3})\b", spaced, flags=re.IGNORECASE)
+    if ep_match and episode is None:
+        episode = int(ep_match.group(1))
+
+    title = spaced
+    title = re.sub(r"\bS\d{1,2}E\d{1,3}\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", title)
+    title = re.sub(r"\b(720p|1080p|2160p|4k|8k|bluray|web[- ]?dl|webrip|hdrip|x264|x265|h264|h265)\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip()
+
+    return {
+        "suggested_media_kind": suggested_kind,
+        "suggested_title": title or spaced or None,
+        "year": year,
+        "season": season,
+        "episode": episode,
+    }
 
 
 class Database:
@@ -166,6 +233,69 @@ class Database:
                 )
             """)
 
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS media_drafts (
+                    draft_id SERIAL PRIMARY KEY,
+                    file_id UUID REFERENCES file_aliases(file_id) ON DELETE CASCADE,
+                    content_hash VARCHAR(64),
+                    review_status VARCHAR(30) DEFAULT 'pending',
+                    suggested_media_kind VARCHAR(50),
+                    user_media_kind VARCHAR(50),
+                    final_media_kind VARCHAR(50),
+                    suggested_title VARCHAR(500),
+                    user_title VARCHAR(500),
+                    final_title VARCHAR(500),
+                    year INTEGER,
+                    season INTEGER,
+                    episode INTEGER,
+                    language VARCHAR(50),
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    reviewed_at TIMESTAMP,
+                    reviewed_by VARCHAR(100),
+                    UNIQUE(file_id)
+                )
+            """)
+
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS media_items (
+                    media_id SERIAL PRIMARY KEY,
+                    file_id UUID REFERENCES file_aliases(file_id) ON DELETE CASCADE,
+                    content_hash VARCHAR(64),
+                    media_kind VARCHAR(50),
+                    title VARCHAR(500),
+                    year INTEGER,
+                    season INTEGER,
+                    episode INTEGER,
+                    language VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(file_id)
+                )
+            """)
+
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS media_collections (
+                    collection_id SERIAL PRIMARY KEY,
+                    title VARCHAR(500) NOT NULL,
+                    collection_type VARCHAR(50) DEFAULT 'unknown',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(title, collection_type)
+                )
+            """)
+
+            conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_id INTEGER REFERENCES media_collections(collection_id)")
+            conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_title VARCHAR(500)")
+            conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_type VARCHAR(50) DEFAULT 'unknown'")
+            conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS season_number INTEGER")
+            conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS episode_number INTEGER")
+
+            conn.run("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS collection_id INTEGER REFERENCES media_collections(collection_id)")
+            conn.run("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS season_number INTEGER")
+            conn.run("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS episode_number INTEGER")
+            conn.run("ALTER TABLE media_items ADD COLUMN IF NOT EXISTS display_order INTEGER")
+
             # Lightweight indexes for common dashboard and lookup paths.
             conn.run("CREATE INDEX IF NOT EXISTS idx_storage_nodes_status_heartbeat ON storage_nodes(status, last_heartbeat)")
             conn.run("CREATE INDEX IF NOT EXISTS idx_file_aliases_content_hash ON file_aliases(content_hash)")
@@ -173,6 +303,10 @@ class Database:
             conn.run("CREATE INDEX IF NOT EXISTS idx_content_locations_content_hash ON content_locations(content_hash)")
             conn.run("CREATE INDEX IF NOT EXISTS idx_content_locations_node_id ON content_locations(node_id)")
             conn.run("CREATE INDEX IF NOT EXISTS idx_contents_hot_created ON contents(is_hot, created_at)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_media_drafts_status_created ON media_drafts(review_status, created_at)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_media_items_kind_title ON media_items(media_kind, title)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_media_items_collection_order ON media_items(collection_id, season_number, episode_number, display_order)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_media_collections_type_title ON media_collections(collection_type, title)")
 
     # ========== Node Management ==========
     def register_node(self, node_id, host, port, shared_space_enabled=False,
@@ -320,7 +454,38 @@ class Database:
                 conn, content_hash, node_id, physical_path, location_type, is_primary=False
             )
 
+            if media_type == "video":
+                draft = suggest_media_draft_from_filename(file_name)
+                self._create_media_draft_in_tx(
+                    conn,
+                    file_id=file_id,
+                    content_hash=content_hash,
+                    suggested_media_kind=draft["suggested_media_kind"],
+                    suggested_title=draft["suggested_title"],
+                    year=draft["year"],
+                    season=draft["season"],
+                    episode=draft["episode"],
+                )
+
         return file_id
+
+    def _create_media_draft_in_tx(self, conn, file_id, content_hash, suggested_media_kind,
+                                  suggested_title=None, year=None, season=None, episode=None):
+        conn.run("""
+            INSERT INTO media_drafts (
+                file_id, content_hash, review_status, suggested_media_kind,
+                suggested_title, year, season, episode
+            )
+            VALUES (
+                :file_id, :content_hash, 'pending', :suggested_media_kind,
+                :suggested_title, :year, :season, :episode
+            )
+            ON CONFLICT (file_id)
+            DO NOTHING
+        """, file_id=file_id, content_hash=content_hash,
+             suggested_media_kind=suggested_media_kind,
+             suggested_title=suggested_title,
+             year=year, season=season, episode=episode)
 
     def _upsert_content_location_in_tx(self, conn, content_hash, node_id, physical_path,
                                        location_type='LOCAL', is_primary=False):
@@ -346,6 +511,31 @@ class Database:
             self._upsert_content_location_in_tx(
                 conn, content_hash, node_id, physical_path, location_type, is_primary
             )
+
+    def update_content_location_path(self, location_id, physical_path, location_type=None):
+        if not location_id or not physical_path:
+            return False
+
+        with self._transaction() as conn:
+            if location_type is None:
+                rows = conn.run("""
+                    UPDATE content_locations
+                    SET physical_path = :physical_path,
+                        last_seen = CURRENT_TIMESTAMP
+                    WHERE location_id = :location_id
+                    RETURNING location_id
+                """, location_id=location_id, physical_path=physical_path) or []
+            else:
+                rows = conn.run("""
+                    UPDATE content_locations
+                    SET physical_path = :physical_path,
+                        location_type = :location_type,
+                        last_seen = CURRENT_TIMESTAMP
+                    WHERE location_id = :location_id
+                    RETURNING location_id
+                """, location_id=location_id, physical_path=physical_path, location_type=location_type) or []
+
+        return bool(rows)
 
     def set_file_hot_status(self, file_id, is_hot=1):
         normalized_hot = 1 if int(is_hot) else 0
@@ -408,7 +598,7 @@ class Database:
         ]
         return [dict(zip(columns, row)) for row in rows]
 
-    def get_best_location(self, file_id):
+    def get_best_location(self, file_id, record_access=True):
         with self._transaction() as conn:
             rows = conn.run("""
                 SELECT
@@ -455,12 +645,13 @@ class Database:
             ]
             best = dict(zip(columns, rows[0]))
 
-            conn.run("""
-                UPDATE contents
-                SET popularity_score = popularity_score + 1,
-                    last_requested_at = CURRENT_TIMESTAMP
-                WHERE content_hash = :content_hash
-            """, content_hash=best['content_hash'])
+            if record_access:
+                conn.run("""
+                    UPDATE contents
+                    SET popularity_score = popularity_score + 1,
+                        last_requested_at = CURRENT_TIMESTAMP
+                    WHERE content_hash = :content_hash
+                """, content_hash=best['content_hash'])
 
             return best
 
@@ -556,6 +747,530 @@ class Database:
             'file_id', 'file_name', 'owner', 'file_size', 'mime_type', 'media_type',
             'content_hash', 'popularity_score', 'is_hot', 'created_at',
             'file_status', 'deleted_at', 'deleted_by'
+        ]
+        return [dict(zip(columns, row)) for row in rows]
+
+    def get_locations_for_file(self, file_id):
+        """Return all known locations for a file alias regardless of lifecycle state."""
+        rows = self._fetch_all("""
+            SELECT
+                fa.file_id, fa.file_name, fa.owner, fa.original_path,
+                fa.created_at, fa.file_status, fa.deleted_at, fa.deleted_by,
+                c.content_hash, c.size_bytes, c.mime_type, c.media_type, c.risk_status,
+                c.popularity_score, c.is_hot,
+                cl.location_id, cl.node_id, cl.physical_path, cl.location_type,
+                cl.is_primary, cl.last_seen,
+                sn.host, sn.port, sn.status AS node_status, sn.shared_space_enabled
+            FROM file_aliases fa
+            JOIN contents c ON fa.content_hash = c.content_hash
+            LEFT JOIN content_locations cl ON c.content_hash = cl.content_hash
+            LEFT JOIN storage_nodes sn ON cl.node_id = sn.node_id
+            WHERE fa.file_id = :file_id
+            ORDER BY cl.last_seen DESC
+        """, file_id=file_id) or []
+
+        columns = [
+            'file_id', 'file_name', 'owner', 'original_path',
+            'created_at', 'file_status', 'deleted_at', 'deleted_by',
+            'content_hash', 'size_bytes', 'mime_type', 'media_type', 'risk_status', 'popularity_score', 'is_hot',
+            'location_id', 'node_id', 'physical_path',
+            'location_type', 'is_primary', 'last_seen', 'host', 'port',
+            'node_status', 'shared_space_enabled'
+        ]
+
+        return [dict(zip(columns, row)) for row in rows]
+
+    def restore_file(self, file_id):
+        """
+        Mark a previously DELETED file alias as ACTIVE. Returns True if transitioned,
+        False if the file wasn't in DELETED state or didn't exist.
+        """
+        with self._transaction() as conn:
+            rows = conn.run("""
+                SELECT file_id
+                FROM file_aliases
+                WHERE file_id = :file_id
+                  AND COALESCE(file_status, 'ACTIVE') = 'DELETED'
+                LIMIT 1
+            """, file_id=file_id) or []
+
+            if not rows:
+                return False
+
+            conn.run("""
+                UPDATE file_aliases
+                SET file_status = 'ACTIVE', deleted_at = NULL, deleted_by = NULL
+                WHERE file_id = :file_id
+            """, file_id=file_id)
+
+        return True
+
+    def list_media_drafts(self, review_status="pending"):
+        rows = self._fetch_all("""
+            SELECT
+                md.draft_id, md.file_id, md.content_hash, md.review_status,
+                md.suggested_media_kind, md.user_media_kind, md.final_media_kind,
+                md.suggested_title, md.user_title, md.final_title,
+                md.year, md.season, md.episode,
+                md.collection_id, md.collection_title, md.collection_type,
+                md.season_number, md.episode_number,
+                md.language, md.notes,
+                md.created_at, md.reviewed_at, md.reviewed_by,
+                fa.file_name, fa.owner, fa.file_status,
+                c.size_bytes, c.mime_type, c.media_type,
+                mc.title AS saved_collection_title,
+                mc.collection_type AS saved_collection_type
+            FROM media_drafts md
+            JOIN file_aliases fa ON md.file_id = fa.file_id
+            JOIN contents c ON md.content_hash = c.content_hash
+            LEFT JOIN media_collections mc ON md.collection_id = mc.collection_id
+            WHERE md.review_status = :review_status
+            ORDER BY md.created_at DESC
+            LIMIT 100
+        """, review_status=review_status)
+        return self._media_draft_rows_to_dicts(rows)
+
+    def get_media_draft(self, draft_id):
+        rows = self._fetch_all("""
+            SELECT
+                md.draft_id, md.file_id, md.content_hash, md.review_status,
+                md.suggested_media_kind, md.user_media_kind, md.final_media_kind,
+                md.suggested_title, md.user_title, md.final_title,
+                md.year, md.season, md.episode,
+                md.collection_id, md.collection_title, md.collection_type,
+                md.season_number, md.episode_number,
+                md.language, md.notes,
+                md.created_at, md.reviewed_at, md.reviewed_by,
+                fa.file_name, fa.owner, fa.file_status,
+                c.size_bytes, c.mime_type, c.media_type,
+                mc.title AS saved_collection_title,
+                mc.collection_type AS saved_collection_type
+            FROM media_drafts md
+            JOIN file_aliases fa ON md.file_id = fa.file_id
+            JOIN contents c ON md.content_hash = c.content_hash
+            LEFT JOIN media_collections mc ON md.collection_id = mc.collection_id
+            WHERE md.draft_id = :draft_id
+            LIMIT 1
+        """, draft_id=draft_id)
+        drafts = self._media_draft_rows_to_dicts(rows)
+        return drafts[0] if drafts else None
+
+    def update_media_draft(self, draft_id, user_media_kind=None, user_title=None,
+                           collection_id=None, collection_title=None,
+                           collection_type="unknown", season_number=None,
+                           episode_number=None):
+        if user_media_kind and user_media_kind not in MEDIA_KIND_VALUES:
+            raise ValueError(f"Invalid media_kind: {user_media_kind}")
+
+        collection_title = (collection_title or "").strip() or None
+        collection_type = collection_type or "unknown"
+        if collection_type not in COLLECTION_TYPE_VALUES:
+            raise ValueError(f"Invalid collection_type: {collection_type}")
+
+        with self._transaction() as conn:
+            if collection_id is None and collection_title:
+                collection_id = self._create_media_collection_in_tx(
+                    conn,
+                    collection_title,
+                    collection_type=collection_type,
+                )
+
+            if collection_id is not None:
+                collection_rows = conn.run("""
+                    SELECT title, collection_type
+                    FROM media_collections
+                    WHERE collection_id = :collection_id
+                    LIMIT 1
+                """, collection_id=collection_id) or []
+                if not collection_rows:
+                    raise ValueError(f"Collection not found: {collection_id}")
+                collection_title = collection_rows[0][0]
+                collection_type = collection_rows[0][1]
+
+            rows = conn.run("""
+                UPDATE media_drafts
+                SET user_media_kind = :user_media_kind,
+                    user_title = :user_title,
+                    collection_id = :collection_id,
+                    collection_title = :collection_title,
+                    collection_type = :collection_type,
+                    season_number = :season_number,
+                    episode_number = :episode_number
+                WHERE draft_id = :draft_id
+                  AND review_status = 'pending'
+                RETURNING draft_id
+            """, draft_id=draft_id, user_media_kind=user_media_kind,
+                 user_title=user_title, collection_id=collection_id,
+                 collection_title=collection_title, collection_type=collection_type,
+                 season_number=season_number, episode_number=episode_number) or []
+
+        return bool(rows)
+
+    def get_media_for_file(self, file_id):
+        draft_rows = self._fetch_all("""
+            SELECT
+                md.draft_id, md.file_id, md.content_hash, md.review_status,
+                md.suggested_media_kind, md.user_media_kind, md.final_media_kind,
+                md.suggested_title, md.user_title, md.final_title,
+                md.year, md.season, md.episode,
+                md.collection_id, md.collection_title, md.collection_type,
+                md.season_number, md.episode_number,
+                md.language, md.notes,
+                md.created_at, md.reviewed_at, md.reviewed_by,
+                fa.file_name, fa.owner, fa.file_status,
+                c.size_bytes, c.mime_type, c.media_type,
+                mc.title AS saved_collection_title,
+                mc.collection_type AS saved_collection_type
+            FROM media_drafts md
+            JOIN file_aliases fa ON md.file_id = fa.file_id
+            JOIN contents c ON md.content_hash = c.content_hash
+            LEFT JOIN media_collections mc ON md.collection_id = mc.collection_id
+            WHERE md.file_id = :file_id
+            ORDER BY md.created_at DESC
+            LIMIT 1
+        """, file_id=file_id)
+        drafts = self._media_draft_rows_to_dicts(draft_rows)
+
+        item_rows = self._fetch_all("""
+            SELECT
+                mi.media_id, mi.file_id, mi.content_hash, mi.media_kind,
+                mi.title, mi.year, mi.season, mi.episode, mi.language,
+                mi.collection_id, mc.title AS collection_title, mc.collection_type,
+                mi.season_number, mi.episode_number, mi.display_order,
+                mi.created_at, mi.updated_at,
+                fa.file_name, fa.owner, fa.file_status,
+                c.size_bytes, c.mime_type, c.media_type,
+                COALESCE(bool_or(sn.status = 'ONLINE'), FALSE) AS is_available
+            FROM media_items mi
+            JOIN file_aliases fa ON mi.file_id = fa.file_id
+            JOIN contents c ON mi.content_hash = c.content_hash
+            LEFT JOIN content_locations cl ON mi.content_hash = cl.content_hash
+            LEFT JOIN storage_nodes sn ON cl.node_id = sn.node_id
+            LEFT JOIN media_collections mc ON mi.collection_id = mc.collection_id
+            WHERE mi.file_id = :file_id
+            GROUP BY mi.media_id, fa.file_id, c.content_hash, mc.collection_id
+            LIMIT 1
+        """, file_id=file_id)
+        items = self._media_item_rows_to_dicts(item_rows)
+
+        return {
+            "draft": drafts[0] if drafts else None,
+            "item": items[0] if items else None,
+            "collections": self.list_media_collections(),
+        }
+
+    def update_media_item_for_file(self, file_id, media_kind=None, title=None,
+                                   collection_id=None, collection_title=None,
+                                   collection_type="unknown", season_number=None,
+                                   episode_number=None, year=None, language=None,
+                                   display_order=None):
+        if media_kind and media_kind not in MEDIA_KIND_VALUES:
+            raise ValueError(f"Invalid media_kind: {media_kind}")
+        if not title:
+            raise ValueError("title is required")
+
+        collection_title = (collection_title or "").strip() or None
+        collection_type = collection_type or "unknown"
+        if collection_type not in COLLECTION_TYPE_VALUES:
+            raise ValueError(f"Invalid collection_type: {collection_type}")
+
+        season = season_number
+        episode = episode_number
+
+        with self._transaction() as conn:
+            if collection_id is None and collection_title:
+                collection_id = self._create_media_collection_in_tx(conn, collection_title, collection_type)
+
+            rows = conn.run("""
+                UPDATE media_items
+                SET media_kind = :media_kind,
+                    title = :title,
+                    year = :year,
+                    season = :season,
+                    episode = :episode,
+                    language = :language,
+                    collection_id = :collection_id,
+                    season_number = :season_number,
+                    episode_number = :episode_number,
+                    display_order = :display_order,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE file_id = :file_id
+                RETURNING media_id
+            """, file_id=file_id, media_kind=media_kind, title=title,
+                 year=year, season=season, episode=episode, language=language,
+                 collection_id=collection_id, season_number=season_number,
+                 episode_number=episode_number, display_order=display_order) or []
+
+        return bool(rows)
+
+    def list_media_collections(self):
+        rows = self._fetch_all("""
+            SELECT collection_id, title, collection_type, created_at, updated_at
+            FROM media_collections
+            ORDER BY collection_type, title
+        """)
+        columns = ['collection_id', 'title', 'collection_type', 'created_at', 'updated_at']
+        return [dict(zip(columns, row)) for row in rows]
+
+    def create_media_collection(self, title, collection_type="unknown"):
+        title = (title or "").strip()
+        collection_type = collection_type or "unknown"
+        if not title:
+            raise ValueError("collection title is required")
+        if collection_type not in COLLECTION_TYPE_VALUES:
+            raise ValueError(f"Invalid collection_type: {collection_type}")
+
+        with self._transaction() as conn:
+            rows = self._get_or_create_media_collection_rows_in_tx(conn, title, collection_type)
+
+        columns = ['collection_id', 'title', 'collection_type', 'created_at', 'updated_at']
+        return dict(zip(columns, rows[0])) if rows else None
+
+    def _create_media_collection_in_tx(self, conn, title, collection_type="unknown"):
+        title = (title or "").strip()
+        collection_type = collection_type or "unknown"
+        if not title:
+            return None
+        if collection_type not in COLLECTION_TYPE_VALUES:
+            raise ValueError(f"Invalid collection_type: {collection_type}")
+
+        rows = self._get_or_create_media_collection_rows_in_tx(conn, title, collection_type)
+        return rows[0][0] if rows else None
+
+    def _get_or_create_media_collection_rows_in_tx(self, conn, title, collection_type):
+        rows = conn.run("""
+            SELECT collection_id, title, collection_type, created_at, updated_at
+            FROM media_collections
+            WHERE title = :title AND collection_type = :collection_type
+            LIMIT 1
+        """, title=title, collection_type=collection_type) or []
+        if rows:
+            return rows
+
+        if collection_type != "unknown":
+            rows = conn.run("""
+                UPDATE media_collections
+                SET collection_type = :collection_type,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE collection_id = (
+                    SELECT collection_id
+                    FROM media_collections
+                    WHERE title = :title AND collection_type = 'unknown'
+                    LIMIT 1
+                )
+                RETURNING collection_id, title, collection_type, created_at, updated_at
+            """, title=title, collection_type=collection_type) or []
+            if rows:
+                return rows
+
+        rows = conn.run("""
+            INSERT INTO media_collections (title, collection_type, updated_at)
+            VALUES (:title, :collection_type, CURRENT_TIMESTAMP)
+            ON CONFLICT (title, collection_type)
+            DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+            RETURNING collection_id, title, collection_type, created_at, updated_at
+        """, title=title, collection_type=collection_type) or []
+        return rows
+
+    def approve_media_draft(self, draft_id, final_media_kind, final_title,
+                            year=None, season=None, episode=None, language=None,
+                            reviewed_by="dashboard-dev", collection_id=None,
+                            collection_title=None, collection_type="unknown",
+                            season_number=None, episode_number=None,
+                            display_order=None):
+        if final_media_kind not in MEDIA_KIND_VALUES:
+            raise ValueError(f"Invalid final_media_kind: {final_media_kind}")
+        if not final_title:
+            raise ValueError("final_title is required")
+
+        season_number = season_number if season_number is not None else season
+        episode_number = episode_number if episode_number is not None else episode
+        season = season if season is not None else season_number
+        episode = episode if episode is not None else episode_number
+
+        with self._transaction() as conn:
+            if collection_id is None and collection_title:
+                collection_id = self._create_media_collection_in_tx(
+                    conn,
+                    collection_title,
+                    collection_type=collection_type,
+                )
+
+            rows = conn.run("""
+                UPDATE media_drafts
+                SET review_status = 'approved',
+                    final_media_kind = :final_media_kind,
+                    final_title = :final_title,
+                    year = :year,
+                    season = :season,
+                    episode = :episode,
+                    language = :language,
+                    reviewed_by = :reviewed_by,
+                    reviewed_at = CURRENT_TIMESTAMP
+                WHERE draft_id = :draft_id
+                  AND review_status = 'pending'
+                RETURNING draft_id, file_id, content_hash
+            """, draft_id=draft_id, final_media_kind=final_media_kind,
+                 final_title=final_title, year=year, season=season,
+                 episode=episode, language=language, reviewed_by=reviewed_by) or []
+
+            if not rows:
+                return False
+
+            _, file_id, content_hash = rows[0]
+            conn.run("""
+                INSERT INTO media_items (
+                    file_id, content_hash, media_kind, title,
+                    year, season, episode, language,
+                    collection_id, season_number, episode_number, display_order,
+                    updated_at
+                )
+                VALUES (
+                    :file_id, :content_hash, :media_kind, :title,
+                    :year, :season, :episode, :language,
+                    :collection_id, :season_number, :episode_number, :display_order,
+                    CURRENT_TIMESTAMP
+                )
+                ON CONFLICT (file_id)
+                DO UPDATE SET
+                    content_hash = EXCLUDED.content_hash,
+                    media_kind = EXCLUDED.media_kind,
+                    title = EXCLUDED.title,
+                    year = EXCLUDED.year,
+                    season = EXCLUDED.season,
+                    episode = EXCLUDED.episode,
+                    language = EXCLUDED.language,
+                    collection_id = EXCLUDED.collection_id,
+                    season_number = EXCLUDED.season_number,
+                    episode_number = EXCLUDED.episode_number,
+                    display_order = EXCLUDED.display_order,
+                    updated_at = CURRENT_TIMESTAMP
+            """, file_id=file_id, content_hash=content_hash,
+                 media_kind=final_media_kind, title=final_title,
+                 year=year, season=season, episode=episode, language=language,
+                 collection_id=collection_id, season_number=season_number,
+                 episode_number=episode_number, display_order=display_order)
+
+        return True
+
+    def reject_media_draft(self, draft_id, reviewed_by="dashboard-dev", reason=None):
+        with self._transaction() as conn:
+            rows = conn.run("""
+                UPDATE media_drafts
+                SET review_status = 'rejected',
+                    reviewed_by = :reviewed_by,
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    notes = :reason
+                WHERE draft_id = :draft_id
+                  AND review_status = 'pending'
+                RETURNING draft_id
+            """, draft_id=draft_id, reviewed_by=reviewed_by, reason=reason) or []
+        return bool(rows)
+
+    def list_media_items(self, include_deleted=False):
+        status_filter = "" if include_deleted else "WHERE COALESCE(fa.file_status, 'ACTIVE') = 'ACTIVE'"
+        rows = self._fetch_all(f"""
+            SELECT
+                mi.media_id, mi.file_id, mi.content_hash, mi.media_kind,
+                mi.title, mi.year, mi.season, mi.episode, mi.language,
+                mi.collection_id, mc.title AS collection_title, mc.collection_type,
+                mi.season_number, mi.episode_number, mi.display_order,
+                mi.created_at, mi.updated_at,
+                fa.file_name, fa.owner, fa.file_status,
+                c.size_bytes, c.mime_type, c.media_type,
+                COALESCE(bool_or(sn.status = 'ONLINE'), FALSE) AS is_available
+            FROM media_items mi
+            JOIN file_aliases fa ON mi.file_id = fa.file_id
+            JOIN contents c ON mi.content_hash = c.content_hash
+            LEFT JOIN content_locations cl ON mi.content_hash = cl.content_hash
+            LEFT JOIN storage_nodes sn ON cl.node_id = sn.node_id
+            LEFT JOIN media_collections mc ON mi.collection_id = mc.collection_id
+            {status_filter}
+            GROUP BY mi.media_id, fa.file_id, c.content_hash, mc.collection_id
+            ORDER BY mi.media_kind, COALESCE(mc.title, mi.title),
+                     mi.season_number NULLS LAST, mi.episode_number NULLS LAST,
+                     mi.display_order NULLS LAST, mi.year NULLS LAST
+        """)
+        return self._media_item_rows_to_dicts(rows)
+
+    def get_media_library_grouped(self):
+        items = self.list_media_items(include_deleted=False)
+        grouped = {
+            "movies": [],
+            "series": {},
+            "anime": {},
+            "youtube": [],
+            "shorts": [],
+            "courses": [],
+            "clips": [],
+            "other": [],
+        }
+
+        for item in items:
+            kind = item.get("media_kind")
+            if kind == "movie":
+                grouped["movies"].append(item)
+            elif kind == "series_episode":
+                self._add_item_to_collection_group(grouped["series"], item)
+            elif kind == "anime_episode":
+                self._add_item_to_collection_group(grouped["anime"], item)
+            elif kind == "youtube_video":
+                grouped["youtube"].append(item)
+            elif kind == "short":
+                grouped["shorts"].append(item)
+            elif kind == "course":
+                grouped["courses"].append(item)
+            elif kind == "clip":
+                grouped["clips"].append(item)
+            else:
+                grouped["other"].append(item)
+
+        grouped["series"] = list(grouped["series"].values())
+        grouped["anime"] = list(grouped["anime"].values())
+        return grouped
+
+    def _add_item_to_collection_group(self, groups, item):
+        collection_id = item.get("collection_id")
+        title = item.get("collection_title") or item.get("title") or "Untitled"
+        key = f"id:{collection_id}" if collection_id else f"title:{title}"
+        season = item.get("season_number")
+        if season is None:
+            season = item.get("season")
+        season_key = str(season if season is not None else 1)
+        if key not in groups:
+            groups[key] = {
+                "collection_id": collection_id,
+                "title": title,
+                "collection_type": item.get("collection_type"),
+                "seasons": {},
+            }
+        groups[key]["seasons"].setdefault(season_key, []).append(item)
+
+    def _media_draft_rows_to_dicts(self, rows):
+        columns = [
+            'draft_id', 'file_id', 'content_hash', 'review_status',
+            'suggested_media_kind', 'user_media_kind', 'final_media_kind',
+            'suggested_title', 'user_title', 'final_title',
+            'year', 'season', 'episode',
+            'collection_id', 'collection_title', 'collection_type',
+            'season_number', 'episode_number',
+            'language', 'notes',
+            'created_at', 'reviewed_at', 'reviewed_by',
+            'file_name', 'owner', 'file_status',
+            'file_size', 'mime_type', 'media_type',
+            'saved_collection_title', 'saved_collection_type'
+        ]
+        return [dict(zip(columns, row)) for row in rows]
+
+    def _media_item_rows_to_dicts(self, rows):
+        columns = [
+            'media_id', 'file_id', 'content_hash', 'media_kind',
+            'title', 'year', 'season', 'episode', 'language',
+            'collection_id', 'collection_title', 'collection_type',
+            'season_number', 'episode_number', 'display_order',
+            'created_at', 'updated_at',
+            'file_name', 'owner', 'file_status',
+            'file_size', 'mime_type', 'media_type', 'is_available'
         ]
         return [dict(zip(columns, row)) for row in rows]
 

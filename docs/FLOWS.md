@@ -76,3 +76,19 @@ Browser
 ## قاعدة مهمة
 Database = Source of Truth.
 Filesystem = Storage Layer.
+
+## Streaming Flow v0.4
+```text
+Dashboard
+  -> Play video
+Master
+  -> GET /api/files/<file_id>/location
+Dashboard
+  -> build http://host:port/api/files/<file_id>/stream
+Browser video player
+  -> GET stream directly from Storage Node
+Storage Node
+  -> verify active Master location
+  -> verify selected node and media_type=video
+  -> serve bytes with Range support
+```

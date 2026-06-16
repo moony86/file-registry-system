@@ -115,6 +115,20 @@ Form:
 ### GET /api/files/<file_id>/download
 تحميل الملف من النود.
 
+### GET /api/files/<file_id>/stream
+Streams video files directly from the selected Storage Node.
+
+Behavior:
+- Resolves the active file location through Master.
+- Refuses non-video files.
+- Does not accept a filesystem path from the client.
+- Supports HTTP Range requests for seek.
+
+Responses:
+- `200 OK` without a Range header.
+- `206 Partial Content` with a valid Range header.
+- `416 Range Not Satisfiable` for invalid ranges.
+
 ### POST /api/files/<file_id>/trash
 ينقل نسخة managed إلى trash.
 

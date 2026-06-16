@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 from database import Database
 from routes.files import create_files_blueprint
+from routes.media import create_media_blueprint
 from routes.nodes import create_nodes_blueprint
 from routes.pages import create_pages_blueprint
 from routes.status import create_status_blueprint
@@ -19,6 +20,7 @@ def create_app() -> Flask:
     app.register_blueprint(create_pages_blueprint())
     app.register_blueprint(create_nodes_blueprint(db))
     app.register_blueprint(create_files_blueprint(db))
+    app.register_blueprint(create_media_blueprint(db))
     app.register_blueprint(create_status_blueprint(db))
 
     start_dead_node_cleanup(db)

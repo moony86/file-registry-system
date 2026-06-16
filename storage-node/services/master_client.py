@@ -97,8 +97,10 @@ class MasterClient:
             timeout=10,
         )
 
-    def get_file_location(self, file_id: str):
+    def get_file_location(self, file_id: str, access_type: str | None = None):
+        params = {"access_type": access_type} if access_type else None
         return requests.get(
             f"{self.master_url}/api/files/{file_id}/location",
+            params=params,
             timeout=5,
         )

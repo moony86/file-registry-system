@@ -62,16 +62,19 @@ def create_files_blueprint(db):
 
     @bp.route("/files/<file_id>/location", methods=["GET"])
     def get_file_location(file_id):
-        loc = db.get_best_location(file_id)
+        access_type = request.args.get("access_type", "download_location")
+        is_stream_location = access_type == "stream_location"
+        loc = db.get_best_location(file_id, record_access=not is_stream_location)
         if not loc:
             return jsonify({"error": "File not found or no online locations", "file_id": file_id}), 404
 
-        db.log_access(
-            file_id=file_id,
-            content_hash=loc["content_hash"],
-            client_ip=request.remote_addr,
-            access_type=loc.get("location_type", "LOCAL"),
-        )
+        if not is_stream_location:
+            db.log_access(
+                file_id=file_id,
+                content_hash=loc["content_hash"],
+                client_ip=request.remote_addr,
+                access_type=access_type,
+            )
 
         return jsonify({
             "file_id": str(file_id),
@@ -97,6 +100,8 @@ def create_files_blueprint(db):
     def get_file_info(file_id):
         locations = db.get_file_locations(file_id)
         if not locations:
+            locations = db.get_locations_for_file(file_id)
+        if not locations:
             return jsonify({"error": "File not found"}), 404
 
         first = locations[0]
@@ -111,6 +116,7 @@ def create_files_blueprint(db):
             "file_status": first.get("file_status", "ACTIVE"),
             "content_hash": first["content_hash"],
             "popularity_score": first["popularity_score"],
+            "is_hot": first.get("is_hot", 0),
             "locations": [
                 {
                     "node_id": loc["node_id"],
@@ -120,6 +126,8 @@ def create_files_blueprint(db):
                     "location_type": loc["location_type"],
                     "is_primary": loc["is_primary"],
                     "node_status": loc["node_status"],
+                    "last_seen": loc.get("last_seen"),
+                    "location_id": loc.get("location_id"),
                 }
                 for loc in locations if loc.get("node_id")
             ],
@@ -129,6 +137,14 @@ def create_files_blueprint(db):
     def list_all_files():
         files = db.list_all_files()
         return jsonify({"count": len(files), "files": files}), 200
+
+    @bp.route("/files/deleted", methods=["GET"])
+    def list_deleted_files():
+        try:
+            files = db.list_deleted_files()
+            return jsonify({"count": len(files), "files": files}), 200
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @bp.route("/files/search", methods=["GET"])
     def search_files():
@@ -222,6 +238,18 @@ def create_files_blueprint(db):
                     "status_code": response.status_code,
                     "response": payload,
                 })
+
+                if response.status_code == 200 and payload.get("status") == "trashed" and payload.get("trash_path"):
+                    try:
+                        updated = db.update_content_location_path(
+                            location_id=loc.get("location_id"),
+                            physical_path=payload["trash_path"],
+                            location_type=location_type,
+                        )
+                        if not updated:
+                            trash_results[-1]["location_update_error"] = "failed to record trash path"
+                    except Exception:
+                        trash_results[-1]["location_update_error"] = "failed to record trash path"
             except Exception as exc:
                 trash_results.append({
                     "node_id": node_id,
@@ -237,5 +265,121 @@ def create_files_blueprint(db):
             "trash_results": trash_results,
         }), 200
 
+
+    @bp.route("/files/<file_id>/restore", methods=["POST"])
+    def restore_file(file_id):
+        if not require_node_token():
+            return jsonify({"error": "Unauthorized"}), 401
+
+        # Read known locations for this file (including deleted state) without
+        # flipping lifecycle yet. Master will mark ACTIVE only after node successes.
+        locations = db.get_locations_for_file(file_id)
+        if locations is None:
+            return jsonify({"error": "File not found"}), 404
+
+        if not locations:
+            return jsonify({"error": "No locations known for file"}), 404
+
+        restore_results = []
+        managed_types = {"CACHED", "PINNED", "REPLICATED"}
+        successful_nodes = 0
+
+        for loc in locations:
+            if not loc.get("location_type"):
+                continue
+            location_type = loc.get("location_type")
+            node_id = loc.get("node_id")
+            host = loc.get("host")
+            port = loc.get("port")
+            node_status = loc.get("node_status")
+
+            # LOCAL means original user path. We never touch it.
+            if location_type not in managed_types:
+                restore_results.append({
+                    "node_id": node_id,
+                    "location_type": location_type,
+                    "action": "skipped",
+                    "reason": "LOCAL/original files are not modified by restore"
+                })
+                continue
+
+            if not host or not port or node_status != "ONLINE":
+                restore_results.append({
+                    "node_id": node_id,
+                    "location_type": location_type,
+                    "action": "skipped",
+                    "reason": "node is offline or missing host/port"
+                })
+                continue
+
+            try:
+                response = requests.post(
+                    f"http://{host}:{port}/api/files/{file_id}/restore-from-trash",
+                    json={
+                        "content_hash": loc.get("content_hash"),
+                        "trash_path": loc.get("physical_path"),
+                        "location_type": location_type,
+                    },
+                    headers={"X-FSYS-Token": request.headers.get("X-FSYS-Token", "")},
+                    timeout=10,
+                )
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = {"raw": response.text}
+
+                restore_results.append({
+                    "node_id": node_id,
+                    "location_type": location_type,
+                    "action": "restore_requested",
+                    "status_code": response.status_code,
+                    "response": payload,
+                })
+
+                # On success, update registry location and count success
+                if response.status_code == 200 and payload.get("status") in ("restored", "already_restored"):
+                    successful_nodes += 1
+                    shared_path = payload.get("shared_space_path")
+                    if shared_path:
+                        try:
+                            updated = db.update_content_location_path(
+                                location_id=loc.get("location_id"),
+                                physical_path=shared_path,
+                                location_type=location_type,
+                            )
+                            if not updated:
+                                db.upsert_content_location(
+                                    content_hash=loc.get("content_hash"),
+                                    node_id=node_id,
+                                    physical_path=shared_path,
+                                    location_type=location_type,
+                                )
+                        except Exception:
+                            # Don't fail the whole operation for a write error; record it
+                            restore_results[-1]["location_update_error"] = "failed to update registry location"
+
+            except Exception as exc:
+                restore_results.append({
+                    "node_id": node_id,
+                    "location_type": location_type,
+                    "action": "restore_failed",
+                    "error": str(exc),
+                })
+
+        reactivated = False
+        if successful_nodes > 0:
+            try:
+                ok = db.restore_file(file_id)
+                reactivated = bool(ok)
+            except Exception:
+                reactivated = False
+
+        return jsonify({
+            "status": "restore_attempted",
+            "file_id": str(file_id),
+            "reactivated": reactivated,
+            "successful_nodes": successful_nodes,
+            "restore_results": restore_results,
+        }), 200
 
     return bp

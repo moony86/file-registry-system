@@ -9,6 +9,13 @@ function escapeHtml(value) {
         .replaceAll("'", "&#039;");
 }
 
+function escapeJsArg(value) {
+    return String(value ?? "")
+        .replaceAll("\\", "\\\\")
+        .replaceAll("'", "\\'")
+        .replaceAll("\n", " ");
+}
+
 function formatBytes(bytes) {
     bytes = Number(bytes || 0);
     if (bytes === 0) return "0 B";
@@ -17,6 +24,18 @@ function formatBytes(bytes) {
     const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
     const value = bytes / Math.pow(k, i);
     return `${value.toFixed(i === 0 ? 0 : 1)} ${sizes[i]}`;
+}
+
+async function fetchJsonOrThrow(url) {
+    const response = await fetch(url);
+    const contentType = response.headers.get("content-type") || "";
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status} for ${url}`);
+    }
+    if (!contentType.includes("application/json")) {
+        throw new Error(`Expected JSON from ${url}, got ${contentType || "unknown content type"}`);
+    }
+    return response.json();
 }
 
 function mediaTypeBadge(mediaType) {
@@ -54,6 +73,234 @@ async function fetchSystemStatus() {
     }
 }
 
+let currentView = 'active'; // 'active', 'deleted', 'media_review', or 'media_library'
+let currentLibraryKind = 'movies';
+let mediaCollections = [];
+const draftSaveTimers = {};
+let currentInspector = null;
+let currentInspectorTab = "overview";
+
+const MEDIA_KIND_OPTIONS = [
+    "movie",
+    "series_episode",
+    "anime_episode",
+    "youtube_video",
+    "short",
+    "course",
+    "clip",
+    "other_video",
+    "unknown",
+];
+
+const COLLECTION_TYPE_OPTIONS = [
+    "anime",
+    "series",
+    "movie_collection",
+    "youtube_channel",
+    "course",
+    "clips",
+    "unknown",
+];
+
+function optionList(options, selectedValue) {
+    return options.map((value) => (
+        `<option value="${escapeHtml(value)}" ${value === selectedValue ? "selected" : ""}>${escapeHtml(value)}</option>`
+    )).join("");
+}
+
+function collectionOptions(selectedId = "") {
+    const normalizedSelected = String(selectedId || "");
+    const rows = [`<option value="" ${normalizedSelected === "" ? "selected" : ""}>No collection</option>`];
+    for (const collection of mediaCollections) {
+        const id = String(collection.collection_id);
+        rows.push(`<option value="${escapeHtml(id)}" ${id === normalizedSelected ? "selected" : ""}>${escapeHtml(collection.title)} (${escapeHtml(collection.collection_type)})</option>`);
+    }
+    rows.push(`<option value="__new__" ${normalizedSelected === "__new__" ? "selected" : ""}>Create New</option>`);
+    return rows.join("");
+}
+
+function draftFieldId(prefix, draftId) {
+    return `${prefix}-${draftId}`;
+}
+
+function isEditingMediaDraft() {
+    const active = document.activeElement;
+    return Boolean(active && active.id && active.id.startsWith("draft-"));
+}
+
+async function fetchMediaCollections() {
+    const data = await fetchJsonOrThrow(`${MASTER_URL}/api/media/collections`);
+    mediaCollections = data.collections || [];
+    return mediaCollections;
+}
+
+function renderViewControls() {
+    const filesTable = document.getElementById("files-table-body");
+    const table = filesTable ? filesTable.parentElement : null;
+    if (!table) return;
+    if (document.getElementById('view-controls')) return;
+    const controlsHtml = `
+        <div id="view-controls" class="mb-4 flex gap-2">
+            <button id="btn-active" class="bg-gray-800 text-gray-200 px-3 py-1 rounded">الملفات النشطة</button>
+            <button id="btn-deleted" class="bg-transparent text-gray-400 px-3 py-1 rounded border border-gray-700">سلة المحذوفات</button>
+            <button id="btn-media-review" class="bg-transparent text-gray-400 px-3 py-1 rounded border border-gray-700">Media Review</button>
+            <button id="btn-media-library" class="bg-transparent text-gray-400 px-3 py-1 rounded border border-gray-700">Media Library</button>
+        </div>`;
+    table.insertAdjacentHTML('beforebegin', controlsHtml);
+    document.getElementById('btn-active').addEventListener('click', () => { currentView = 'active'; updateViewButtons(); refreshDashboard(); });
+    document.getElementById('btn-deleted').addEventListener('click', () => { currentView = 'deleted'; updateViewButtons(); refreshDashboard(); });
+    document.getElementById('btn-media-review').addEventListener('click', () => { currentView = 'media_review'; updateViewButtons(); refreshDashboard(); });
+    document.getElementById('btn-media-library').addEventListener('click', () => { currentView = 'media_library'; updateViewButtons(); refreshDashboard(); });
+}
+
+function updateViewButtons() {
+    const buttons = {
+        active: document.getElementById('btn-active'),
+        deleted: document.getElementById('btn-deleted'),
+        media_review: document.getElementById('btn-media-review'),
+        media_library: document.getElementById('btn-media-library'),
+    };
+    for (const [view, button] of Object.entries(buttons)) {
+        if (!button) continue;
+        button.className = view === currentView
+            ? 'bg-gray-800 text-gray-200 px-3 py-1 rounded'
+            : 'bg-transparent text-gray-400 px-3 py-1 rounded border border-gray-700';
+    }
+}
+
+async function fetchDeletedFiles() {
+    try {
+        const response = await fetch(`${MASTER_URL}/api/files/deleted`);
+        const data = await response.json();
+        document.getElementById("total-files-count").innerText = data.count || 0;
+        const filesTable = document.getElementById("files-table-body");
+        filesTable.innerHTML = "";
+        for (const file of data.files || []) {
+            const nameDisplay = `<span class="text-gray-400">${escapeHtml(file.file_name)}</span>`;
+            filesTable.innerHTML += `
+                <tr class="hover:bg-gray-700/20 transition">
+                    <td class="py-4 pr-2">${nameDisplay}</td>
+                    <td class="py-4">${mediaTypeBadge(file.media_type)}</td>
+                    <td class="py-4 text-gray-400">DELETED</td>
+                    <td class="py-4 text-gray-400">unavailable</td>
+                    <td class="py-4 text-gray-400 text-xs">${file.deleted_at ? escapeHtml(file.deleted_at) : ''}</td>
+                    <td class="py-4 text-gray-400 text-xs">${file.deleted_by ? escapeHtml(file.deleted_by) : ''}</td>
+                    <td class="py-4 font-mono text-xs text-yellow-500">${file.popularity_score || 0}</td>
+                    <td class="py-4 text-center"><div class="flex justify-center gap-2">
+                        <button onclick="showDetails('${file.file_id}')" class="action-btn action-btn-details">Details</button>
+                    </div></td>
+                </tr>`;
+        }
+    } catch (error) {
+        console.error("فشل جلب المحذوفات:", error);
+    }
+}
+
+async function fetchMediaDrafts() {
+    const filesTable = document.getElementById("files-table-body");
+    try {
+        await fetchMediaCollections();
+        const data = await fetchJsonOrThrow(`${MASTER_URL}/api/media/drafts`);
+        document.getElementById("total-files-count").innerText = data.count || 0;
+        filesTable.innerHTML = "";
+        for (const draft of data.drafts || []) {
+            const title = draft.user_title || draft.final_title || draft.suggested_title || draft.file_name;
+            const kind = draft.user_media_kind || draft.final_media_kind || draft.suggested_media_kind || "unknown";
+            filesTable.innerHTML += `
+                <tr class="hover:bg-gray-700/20 transition">
+                    <td class="py-4 pr-2">
+                        <span class="text-gray-200">${escapeHtml(draft.file_name)}</span>
+                    </td>
+                    <td class="py-4">${mediaTypeBadge(draft.media_type)}</td>
+                    <td class="py-4 text-gray-300">${escapeHtml(kind)}</td>
+                    <td class="py-4 text-gray-400">pending review</td>
+                    <td class="py-4 text-gray-400 text-xs">${escapeHtml(title)}</td>
+                    <td class="py-4 text-gray-400 text-xs">${escapeHtml(draft.review_status)}</td>
+                    <td class="py-4 font-mono text-xs text-yellow-500">${escapeHtml(draft.season_number || draft.season || "")}${draft.episode_number || draft.episode ? ` / E${escapeHtml(draft.episode_number || draft.episode)}` : ""}</td>
+                    <td class="py-4 text-center"><div class="flex justify-center gap-2">
+                        <button onclick="showDetails('${draft.file_id}')" class="action-btn action-btn-details">Details</button>
+                    </div></td>
+                </tr>`;
+        }
+    } catch (error) {
+        console.error("Failed to fetch media drafts:", error);
+        if (filesTable) {
+            filesTable.innerHTML = `<tr><td colspan="8" class="py-4 text-red-400">Media Review API is not available. Restart Master Node and refresh.</td></tr>`;
+        }
+    }
+}
+
+function flattenLibraryItems(library, kind) {
+    if (kind === "series" || kind === "anime") {
+        return (library[kind] || []).flatMap((group) => {
+            const seasons = group.seasons || {};
+            return Object.entries(seasons).flatMap(([seasonNumber, episodes]) =>
+                (episodes || []).map((episode) => ({
+                    ...episode,
+                    group_title: group.title,
+                    group_season: seasonNumber,
+                }))
+            );
+        });
+    }
+    return library[kind] || [];
+}
+
+async function fetchMediaLibrary() {
+    const filesTable = document.getElementById("files-table-body");
+    try {
+        const library = await fetchJsonOrThrow(`${MASTER_URL}/api/media/library`);
+        const kinds = ["movies", "series", "anime", "youtube", "shorts", "courses", "clips", "other"];
+        const items = flattenLibraryItems(library, currentLibraryKind);
+        document.getElementById("total-files-count").innerText = items.length || 0;
+
+        const tabs = kinds.map((kind) => `
+            <button onclick="setLibraryKind('${kind}')" class="${kind === currentLibraryKind ? 'bg-gray-700 text-white' : 'bg-transparent text-gray-400 border border-gray-700'} px-2 py-1 rounded text-xs">${kind}</button>
+        `).join("");
+
+        const rows = items.map((item) => {
+            const seasonValue = item.season_number || item.season || item.group_season;
+            const episodeValue = item.episode_number || item.episode;
+            const seasonEpisode = seasonValue || episodeValue
+                ? `S${seasonValue || ""}E${episodeValue || ""}`
+                : "";
+            const title = item.group_title || item.title;
+            const availability = item.is_available ? "available" : "unavailable";
+            const playButton = item.file_status === "ACTIVE" && item.is_available
+                ? `<button onclick="playVideo('${item.file_id}')" class="bg-cyan-600 text-white px-3 py-1 rounded-lg text-xs font-semibold hover:bg-cyan-500 transition">Play</button>`
+                : "";
+            return `
+                <tr class="hover:bg-gray-700/20 transition">
+                    <td class="py-4 pr-2"><span class="text-gray-200">${escapeHtml(title)}</span></td>
+                    <td class="py-4">${escapeHtml(item.media_kind)}</td>
+                    <td class="py-4 text-gray-400">${escapeHtml(item.year || "")}</td>
+                    <td class="py-4 text-gray-400">${escapeHtml(seasonEpisode)}</td>
+                    <td class="py-4 text-gray-400 text-xs">${escapeHtml(item.file_name)}</td>
+                    <td class="py-4">${escapeHtml(availability)}</td>
+                    <td class="py-4 font-mono text-xs text-yellow-500">${escapeHtml(item.language || "")}</td>
+                    <td class="py-4 text-center"><div class="flex justify-center gap-2">
+                        ${playButton}
+                        <button onclick="showDetails('${item.file_id}')" class="action-btn action-btn-details">Details</button>
+                    </div></td>
+                </tr>`;
+        }).join("");
+
+        filesTable.innerHTML = `
+            <tr><td colspan="8" class="py-3"><div class="flex flex-wrap gap-2">${tabs}</div></td></tr>
+            ${rows || '<tr><td colspan="8" class="py-4 text-gray-500">No approved media in this group.</td></tr>'}`;
+    } catch (error) {
+        console.error("Failed to fetch media library:", error);
+        if (filesTable) {
+            filesTable.innerHTML = `<tr><td colspan="8" class="py-4 text-red-400">Media Library API is not available. Restart Master Node and refresh.</td></tr>`;
+        }
+    }
+}
+
+function setLibraryKind(kind) {
+    currentLibraryKind = kind;
+    fetchMediaLibrary();
+}
+
 async function fetchFilesList() {
     try {
         const response = await fetch(`${MASTER_URL}/api/files`);
@@ -62,35 +309,30 @@ async function fetchFilesList() {
         const filesTable = document.getElementById("files-table-body");
         filesTable.innerHTML = "";
         for (const file of data.files || []) {
-            const isHot = file.is_hot === 1;
-            const nameDisplay = isHot
-                ? `<span class="font-bold text-red-400 flex items-center gap-1">🔥 ${escapeHtml(file.file_name)} <span class="bg-red-500/10 text-red-400 px-1 rounded text-[10px]">HOT</span></span>`
-                : `<span class="text-gray-200">${escapeHtml(file.file_name)}</span>`;
-            const pinButton = isHot
-                ? `<button onclick="togglePin('${file.file_id}', true)" class="bg-gray-700 text-gray-300 px-3 py-1 rounded-lg text-xs font-semibold hover:bg-gray-600 transition">إلغاء التثبيت</button>`
-                : `<button onclick="togglePin('${file.file_id}', false)" class="bg-red-500/10 text-red-400 border border-red-500/20 px-3 py-1 rounded-lg text-xs font-semibold hover:bg-red-500 hover:text-white transition">HOT 🔥</button>`;
+            const nameDisplay = `<span class="text-gray-200">${escapeHtml(file.file_name)}</span>`;
+            const playButton = file.media_type === "video"
+                ? `<button onclick="playVideo('${file.file_id}')" class="bg-cyan-600 text-white px-3 py-1 rounded-lg text-xs font-semibold hover:bg-cyan-500 transition">Play</button>`
+                : "";
             filesTable.innerHTML += `
                 <tr class="hover:bg-gray-700/30 transition">
                     <td class="py-4 pr-2">${nameDisplay}</td>
                     <td class="py-4">${mediaTypeBadge(file.media_type)}</td>
-                    <td class="py-4 text-gray-400">${escapeHtml(file.owner)}</td>
+                    <td class="py-4 text-gray-400">${escapeHtml(file.file_status || "ACTIVE")}</td>
+                    <td class="py-4">${file.is_available ? "available" : "unavailable"}</td>
+                    <td class="py-4">${file.in_shared_space ? "shared" : "local/other"}</td>
                     <td class="py-4 text-gray-400 text-xs">${formatBytes(file.file_size)}</td>
-                    <td class="py-4">${file.is_available ? "✅ نعم" : "❌ لا"}</td>
-                    <td class="py-4">${file.in_shared_space ? "📦 نعم" : "🔗 لا"}</td>
                     <td class="py-4 font-mono text-xs text-yellow-500">${file.popularity_score || 0}</td>
                     <td class="py-4 text-center"><div class="flex justify-center gap-2">
+                        ${playButton}
                         <button onclick="showDetails('${file.file_id}')" class="action-btn action-btn-details">Details</button>
-                        ${pinButton}
-                        <button onclick="deleteFile('${file.file_id}')" class="bg-red-900/30 text-red-300 border border-red-700/40 px-3 py-1 rounded-lg text-xs font-semibold hover:bg-red-700 hover:text-white transition">Delete</button>
                     </div></td>
                 </tr>`;
         }
     } catch (error) {
-        console.error("فشل جلب قائمة الملفات:", error);
+        console.error("Failed to fetch files:", error);
     }
 }
-
-async function togglePin(fileId, isCurrentlyPinned) {
+async function togglePin(fileId, isCurrentlyPinned, options = {}) {
     const shouldBeHot = isCurrentlyPinned ? 0 : 1;
     try {
         const response = await fetch(`${MASTER_URL}/api/files/${fileId}/hot`, {
@@ -98,81 +340,736 @@ async function togglePin(fileId, isCurrentlyPinned) {
             headers: { "Content-Type": "application/json", "X-FSYS-Token": ADMIN_TOKEN },
             body: JSON.stringify({ is_hot: shouldBeHot }),
         });
-        if (response.ok) await fetchFilesList();
-        else alert("فشلت العملية: تأكد من صلاحيات التوكن الخاص بالأدمن");
+        if (response.ok) {
+            if (options.refresh !== false) await fetchFilesList();
+            return true;
+        }
+        const data = await response.json().catch(() => ({}));
+        alert(`HOT update failed: ${data.error || "check admin token"}`);
+        return false;
     } catch (error) {
-        console.error("خطأ أثناء تعديل حالة التثبيت:", error);
+        console.error("HOT update failed:", error);
+        return false;
+    }
+}
+async function playVideo(fileId) {
+    try {
+        const response = await fetch(`${MASTER_URL}/api/files/${fileId}/location?access_type=stream_location`);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            alert(`Cannot play video: ${data.error || "file is not available"}`);
+            return;
+        }
+        if (data.media_type !== "video") {
+            alert("Only video files can be played.");
+            return;
+        }
+
+        const host = data.node && data.node.host;
+        const port = data.node && data.node.port;
+        if (!host || !port) {
+            alert("Cannot play video: storage node location is missing.");
+            return;
+        }
+
+        ensureVideoModal();
+        const modal = document.getElementById("video-modal");
+        const player = document.getElementById("video-player");
+        const title = document.getElementById("video-title");
+        title.innerText = data.file_name || "Video";
+        player.src = `http://${host}:${port}/api/files/${fileId}/stream`;
+        modal.classList.remove("hidden");
+        player.play().catch(() => {});
+    } catch (error) {
+        alert(`Cannot play video: ${error}`);
     }
 }
 
-async function deleteFile(fileId) {
-    const confirmed = confirm(
-        "سيتم إخفاء الملف من المكتبة ونقل النسخ المُدارة داخل shared_space إلى trash.\n" +
-        "لن يتم حذف ملفات LOCAL الأصلية من جهاز المستخدم.\n\n" +
-        "هل تريد المتابعة؟"
-    );
-    if (!confirmed) return;
+function ensureVideoModal() {
+    if (document.getElementById("video-modal")) return;
+
+    document.body.insertAdjacentHTML("beforeend", `
+        <div id="video-modal" class="hidden fixed inset-0 z-50 bg-black/80 p-4">
+            <div class="max-w-5xl mx-auto mt-10 bg-gray-950 border border-gray-700 rounded-xl shadow-2xl overflow-hidden">
+                <div class="flex items-center justify-between px-5 py-4 border-b border-gray-700 bg-gray-900">
+                    <h3 id="video-title" class="font-bold text-gray-100">Video</h3>
+                    <button id="video-close-btn" class="text-gray-400 hover:text-white text-xl">x</button>
+                </div>
+                <video id="video-player" class="w-full bg-black max-h-[75vh]" controls autoplay></video>
+            </div>
+        </div>
+    `);
+    bindVideoModalEvents();
+}
+
+function bindVideoModalEvents() {
+    const closeButton = document.getElementById("video-close-btn");
+    const modal = document.getElementById("video-modal");
+    if (closeButton && !closeButton.dataset.bound) {
+        closeButton.addEventListener("click", closeVideoModal);
+        closeButton.dataset.bound = "true";
+    }
+    if (modal && !modal.dataset.bound) {
+        modal.addEventListener("click", (event) => { if (event.target.id === "video-modal") closeVideoModal(); });
+        modal.dataset.bound = "true";
+    }
+}
+
+function closeVideoModal() {
+    const modal = document.getElementById("video-modal");
+    const player = document.getElementById("video-player");
+    if (!modal || !player) return;
+    player.pause();
+    player.removeAttribute("src");
+    player.load();
+    modal.classList.add("hidden");
+}
+
+function readOptionalInt(elementId) {
+    const element = document.getElementById(elementId);
+    if (!element || element.value === "") return null;
+    const value = Number(element.value);
+    return Number.isFinite(value) ? value : null;
+}
+
+function collectMediaDraftPayload(draftId) {
+    const collectionId = readOptionalInt(`draft-collection-${draftId}`);
+    const collectionTitle = document.getElementById(`draft-new-collection-${draftId}`)?.value.trim();
+    const episodeNumber = readOptionalInt(`draft-episode-${draftId}`);
+    return {
+        media_kind: document.getElementById(`draft-kind-${draftId}`)?.value || "unknown",
+        final_media_kind: document.getElementById(`draft-kind-${draftId}`)?.value || "unknown",
+        final_title: document.getElementById(`draft-title-${draftId}`)?.value.trim(),
+        collection_id: collectionId,
+        collection_title: collectionId ? "" : collectionTitle,
+        collection_type: document.getElementById(`draft-collection-type-${draftId}`)?.value || "unknown",
+        season_number: readOptionalInt(`draft-season-${draftId}`),
+        episode_number: episodeNumber,
+        display_order: episodeNumber,
+        language: "",
+        reviewed_by: "dashboard-dev",
+    };
+}
+
+function setDraftSaveStatus(draftId, message, isError = false) {
+    const status = document.getElementById(`draft-save-status-${draftId}`);
+    if (!status) return;
+    status.innerText = message;
+    status.className = isError ? "text-[11px] text-red-400 mt-1" : "text-[11px] text-green-400 mt-1";
+}
+
+function saveMediaDraftDebounced(draftId) {
+    setDraftSaveStatus(draftId, "Saving...");
+    clearTimeout(draftSaveTimers[draftId]);
+    draftSaveTimers[draftId] = setTimeout(() => saveMediaDraft(draftId, { silent: true }), 600);
+}
+
+async function saveMediaDraft(draftId, options = {}) {
+    const payload = collectMediaDraftPayload(draftId);
+    if (!payload.final_title) {
+        setDraftSaveStatus(draftId, "Title is required", true);
+        return null;
+    }
+
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/drafts/${draftId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const message = data.error || "unknown error";
+            setDraftSaveStatus(draftId, `Save failed: ${message}`, true);
+            if (!options.silent) alert(`Save failed: ${message}`);
+            return null;
+        }
+        if (data.draft && data.draft.collection_id) {
+            const collectionSelect = document.getElementById(`draft-collection-${draftId}`);
+            await fetchMediaCollections();
+            if (collectionSelect && !collectionSelect.value) {
+                collectionSelect.innerHTML = collectionOptions(data.draft.collection_id);
+                document.getElementById(`draft-new-collection-${draftId}`).value = "";
+            }
+        }
+        setDraftSaveStatus(draftId, "Changes Saved");
+        return data.draft || {};
+    } catch (error) {
+        setDraftSaveStatus(draftId, `Save failed: ${error.message || error}`, true);
+        if (!options.silent) alert(`Save failed: ${error.message || error}`);
+        return null;
+    }
+}
+
+async function approveMediaDraft(draftId) {
+    const savedDraft = await saveMediaDraft(draftId);
+    if (!savedDraft) return;
+    const payload = collectMediaDraftPayload(draftId);
+
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/drafts/${draftId}/approve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            alert(`Approve failed: ${data.error || "unknown error"}`);
+            return;
+        }
+        await fetchMediaDrafts();
+    } catch (error) {
+        alert(`Approve failed: ${error}`);
+    }
+}
+
+async function rejectMediaDraft(draftId, options = {}) {
+    const reason = options.reason !== undefined ? options.reason : prompt("Reject reason", "");
+    if (reason === null) return false;
+
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/drafts/${draftId}/reject`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reviewed_by: "dashboard-dev", reason }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            alert(`Reject failed: ${data.error || "unknown error"}`);
+            return false;
+        }
+        if (options.refresh !== false) await fetchMediaDrafts();
+        return true;
+    } catch (error) {
+        alert(`Reject failed: ${error}`);
+        return false;
+    }
+}
+async function deleteFile(fileId, options = {}) {
+    const confirmed = options.confirmed === true || confirm("Delete this file from the active library and move managed shared-space copies to trash when possible?");
+    if (!confirmed) return false;
 
     try {
         const response = await fetch(`${MASTER_URL}/api/files/${fileId}`, {
             method: "DELETE",
-            headers: {
-                "Content-Type": "application/json",
-                "X-FSYS-Token": ADMIN_TOKEN,
-            },
+            headers: { "Content-Type": "application/json", "X-FSYS-Token": ADMIN_TOKEN },
             body: JSON.stringify({ deleted_by: "dashboard-dev" }),
         });
-
         const data = await response.json().catch(() => ({}));
         if (response.ok) {
-            closeDetailsModal();
-            await refreshDashboard();
-            alert("تم حذف الملف من المكتبة ونقل النسخ المُدارة إلى trash عند الإمكان.");
-        } else {
-            alert(`فشل الحذف: ${data.error || "خطأ غير معروف"}`);
+            if (options.refresh !== false) {
+                closeDetailsModal();
+                await refreshDashboard();
+                alert("File deleted from active library. Managed copies were moved to trash where possible.");
+            }
+            return true;
         }
+        alert(`Delete failed: ${data.error || "unknown error"}`);
+        return false;
     } catch (error) {
-        alert(`خطأ أثناء الحذف: ${error}`);
+        alert(`Delete failed: ${error}`);
+        return false;
     }
 }
+async function restoreFile(fileId, options = {}) {
+    const confirmed = options.confirmed === true || confirm("Restore this file to ACTIVE and restore managed copies from trash when possible?");
+    if (!confirmed) return false;
 
+    try {
+        const response = await fetch(`${MASTER_URL}/api/files/${fileId}/restore`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-FSYS-Token": ADMIN_TOKEN },
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok && !data.reactivated) {
+            const reason = data.error || `reactivated=${Boolean(data.reactivated)}, successful_nodes=${data.successful_nodes || 0}`;
+            alert(`Restore did not complete: ${reason}`);
+            if (options.refresh !== false) await refreshDashboard();
+            return false;
+        }
+        if (response.ok) {
+            if (options.refresh !== false) {
+                closeDetailsModal();
+                await refreshDashboard();
+                alert("File restored to ACTIVE.");
+            }
+            return true;
+        }
+        alert(`Restore failed: ${data.error || "unknown error"}`);
+        return false;
+    } catch (error) {
+        alert(`Restore failed: ${error}`);
+        return false;
+    }
+}
 async function showDetails(fileId) {
     const modal = document.getElementById("details-modal");
     const content = document.getElementById("details-content");
-    content.innerHTML = `<p class="text-gray-400">جاري تحميل التفاصيل...</p>`;
+    content.innerHTML = `<p class="text-gray-400">Loading file inspector...</p>`;
     modal.classList.remove("hidden");
     try {
-        const response = await fetch(`${MASTER_URL}/api/files/${fileId}`);
-        const data = await response.json();
-        if (!response.ok) {
-            content.innerHTML = `<p class="text-red-400">${escapeHtml(data.error || "فشل جلب تفاصيل الملف")}</p>`;
+        const [fileResponse, mediaResponse] = await Promise.all([
+            fetch(`${MASTER_URL}/api/files/${fileId}`),
+            fetch(`${MASTER_URL}/api/media/files/${fileId}`),
+        ]);
+        const file = await fileResponse.json().catch(() => ({}));
+        const media = await mediaResponse.json().catch(() => ({}));
+        if (!fileResponse.ok) {
+            content.innerHTML = `<p class="text-red-400">${escapeHtml(file.error || "Failed to load file details")}</p>`;
             return;
         }
-        const locations = (data.locations || []).map((loc) => `
-            <div class="bg-gray-800 border border-gray-700 rounded-lg p-3 space-y-1">
-                <div><span class="text-gray-400">Node:</span> <span class="text-cyan-400">${escapeHtml(loc.node_id)}</span></div>
-                <div><span class="text-gray-400">Host:</span> ${escapeHtml(loc.host)}:${escapeHtml(loc.port)}</div>
-                <div><span class="text-gray-400">Type:</span> ${escapeHtml(loc.location_type)}</div>
-                <div><span class="text-gray-400">Status:</span> ${escapeHtml(loc.node_status)}</div>
-                <div class="text-xs text-gray-500 break-all">${escapeHtml(loc.path)}</div>
-            </div>`).join("");
-        content.innerHTML = `
-            <div class="detail-row"><div class="detail-label">الاسم</div><div class="detail-value">${escapeHtml(data.file_name)}</div></div>
-            <div class="detail-row"><div class="detail-label">النوع</div><div class="detail-value">${mediaTypeBadge(data.media_type)} <span class="text-gray-500 mr-2">${escapeHtml(data.mime_type)}</span></div></div>
-            <div class="detail-row"><div class="detail-label">الحجم</div><div class="detail-value">${formatBytes(data.file_size)}</div></div>
-            <div class="detail-row"><div class="detail-label">المالك</div><div class="detail-value">${escapeHtml(data.owner)}</div></div>
-            <div class="detail-row"><div class="detail-label">تاريخ الإضافة</div><div class="detail-value">${escapeHtml(data.created_at || "غير متاح")}</div></div>
-            <div class="detail-row"><div class="detail-label">الهاش</div><div class="detail-value font-mono text-xs">${escapeHtml(data.content_hash)}</div></div>
-            <div class="detail-row"><div class="detail-label">التحميلات</div><div class="detail-value">${data.popularity_score || 0}</div></div>
-            <div><div class="detail-label mb-2">المواقع</div><div class="space-y-2">${locations || '<p class="text-gray-500">لا توجد مواقع متاحة.</p>'}</div></div>`;
+        if (!mediaResponse.ok) {
+            media.error = media.error || "Failed to load media details";
+        }
+        currentInspector = { file, media };
+        currentInspectorTab = "overview";
+        renderFileInspector();
     } catch (error) {
-        content.innerHTML = `<p class="text-red-400">خطأ أثناء جلب التفاصيل: ${escapeHtml(error)}</p>`;
+        content.innerHTML = `<p class="text-red-400">Failed to load file inspector: ${escapeHtml(error.message || error)}</p>`;
     }
+}
+
+function inspectorTabButton(id, label) {
+    const active = currentInspectorTab === id;
+    return `<button onclick="setInspectorTab('${id}')" class="${active ? "bg-cyan-700 text-white" : "bg-gray-800 text-gray-300 border border-gray-700"} px-3 py-1 rounded text-xs font-semibold">${label}</button>`;
+}
+
+function setInspectorTab(tab) {
+    currentInspectorTab = tab;
+    renderFileInspector();
+}
+
+function renderFileInspector() {
+    if (!currentInspector) return;
+    const content = document.getElementById("details-content");
+    const file = currentInspector.file;
+    const body = {
+        overview: renderOverviewTab,
+        media: renderMediaTab,
+        actions: renderActionsTab,
+        locations: renderLocationsTab,
+        debug: renderDebugTab,
+    }[currentInspectorTab]();
+
+    content.innerHTML = `
+        <div class="space-y-4">
+            <div class="flex flex-wrap gap-2 border-b border-gray-800 pb-3">
+                ${inspectorTabButton("overview", "Overview")}
+                ${inspectorTabButton("media", "Media")}
+                ${inspectorTabButton("actions", "Actions")}
+                ${inspectorTabButton("locations", "Locations")}
+                ${inspectorTabButton("debug", "Debug")}
+            </div>
+            <div class="flex items-start justify-between gap-4">
+                <div>
+                    <h4 class="text-lg font-bold text-gray-100">${escapeHtml(file.file_name)}</h4>
+                    <p class="text-xs text-gray-500 font-mono">${escapeHtml(file.file_id)}</p>
+                </div>
+                <span class="text-xs px-2 py-1 rounded bg-gray-800 text-gray-300">${escapeHtml(file.file_status || "ACTIVE")}</span>
+            </div>
+            ${body}
+        </div>`;
+}
+
+function renderOverviewTab() {
+    const file = currentInspector.file;
+    const hash = file.content_hash || "";
+    return `
+        <section class="space-y-3">
+            ${detailRow("File name", file.file_name)}
+            ${detailRow("File ID", file.file_id)}
+            ${detailRow("Owner", file.owner)}
+            ${detailRow("Size", formatBytes(file.file_size))}
+            ${detailRow("MIME type", file.mime_type)}
+            ${detailRow("Media type", file.media_type)}
+            ${detailRow("Status", file.file_status || "ACTIVE")}
+            ${detailRow("Created at", file.created_at || "")}
+            ${detailRow("Content hash", hash)}
+            ${detailRow("Popularity", file.popularity_score || 0)}
+        </section>`;
+}
+
+function mediaContextValues() {
+    const media = currentInspector.media || {};
+    const draft = media.draft;
+    const item = media.item;
+    if (item) {
+        return {
+            mode: "item",
+            id: item.media_id,
+            kind: item.media_kind || "unknown",
+            title: item.title || "",
+            collectionId: item.collection_id || "",
+            collectionTitle: item.collection_title || "",
+            collectionType: item.collection_type || "unknown",
+            season: item.season_number || item.season || "",
+            episode: item.episode_number || item.episode || "",
+            year: item.year || "",
+            language: item.language || "",
+            reviewStatus: "approved",
+        };
+    }
+    if (draft) {
+        const kind = draft.user_media_kind || draft.final_media_kind || draft.suggested_media_kind || "unknown";
+        const hasDraftCollectionTitle = !draft.collection_id && (draft.collection_title || draft.saved_collection_title);
+        return {
+            mode: "draft",
+            id: draft.draft_id,
+            kind,
+            title: draft.user_title || draft.final_title || draft.suggested_title || currentInspector.file.file_name || "",
+            collectionId: draft.collection_id || (hasDraftCollectionTitle ? "__new__" : ""),
+            collectionTitle: draft.collection_title || draft.saved_collection_title || "",
+            collectionType: draft.collection_type || draft.saved_collection_type || (kind === "anime_episode" ? "anime" : kind === "series_episode" ? "series" : "unknown"),
+            season: draft.season_number || draft.season || 1,
+            episode: draft.episode_number || draft.episode || "",
+            year: draft.year || "",
+            language: draft.language || "",
+            reviewStatus: draft.review_status || "pending",
+        };
+    }
+    return null;
+}
+
+function renderMediaTab() {
+    const file = currentInspector.file;
+    const media = currentInspector.media || {};
+    if (file.media_type !== "video") {
+        return `<p class="text-gray-500 border border-gray-800 rounded p-4">No media metadata for this file.</p>`;
+    }
+    const values = mediaContextValues();
+    if (!values) {
+        return `<p class="text-gray-500 border border-gray-800 rounded p-4">No media draft or approved item found for this video.</p>`;
+    }
+    mediaCollections = media.collections || mediaCollections;
+    const currentCollectionText = values.collectionId && values.collectionId !== "__new__"
+        ? `${values.collectionTitle || "Selected collection"} (${values.collectionType || "unknown"})`
+        : values.collectionTitle
+            ? `${values.collectionTitle} (${values.collectionType || "unknown"})`
+            : "None";
+    const showNewCollection = values.collectionId === "__new__";
+    return `
+        <section class="space-y-4">
+            <div class="text-xs text-gray-400">Mode: <span class="text-cyan-300">${escapeHtml(values.mode)}</span> | Review status: ${escapeHtml(values.reviewStatus)}</div>
+            <div class="text-xs text-gray-400">Current Collection: <span class="text-cyan-300">${escapeHtml(currentCollectionText)}</span></div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                ${fieldSelect("inspector-media-kind", "Media Kind", MEDIA_KIND_OPTIONS, values.kind)}
+                ${fieldInput("inspector-title", "Title", values.title)}
+                ${fieldSelectHtml("inspector-collection", "Collection", collectionOptions(values.collectionId), "handleInspectorCollectionChange()")}
+                <div id="inspector-new-collection-wrap" class="${showNewCollection ? "" : "hidden"}">
+                    ${fieldInput("inspector-new-collection", "New Collection Title", values.collectionTitle)}
+                </div>
+                ${fieldSelect("inspector-collection-type", "Collection Type", COLLECTION_TYPE_OPTIONS, values.collectionType)}
+                ${fieldInput("inspector-season", "Season", values.season, "number")}
+                ${fieldInput("inspector-episode", "Episode", values.episode, "number")}
+                ${fieldInput("inspector-year", "Year", values.year, "number")}
+                ${fieldInput("inspector-language", "Language", values.language)}
+            </div>
+            <div id="inspector-media-status" class="text-xs text-gray-500"></div>
+            <div class="flex flex-wrap gap-2">
+                <button onclick="saveMediaChanges()" class="bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold">Save Changes</button>
+                ${values.mode === "draft" ? `<button onclick="approveDraftFromInspector()" class="bg-green-700 text-white px-3 py-1 rounded text-xs font-semibold">Approve</button><button onclick="rejectDraftFromInspector()" class="bg-red-900/40 text-red-200 border border-red-700/50 px-3 py-1 rounded text-xs font-semibold">Reject</button>` : ""}
+            </div>
+        </section>`;
+}
+
+function renderActionsTab() {
+    const file = currentInspector.file;
+    const isActive = (file.file_status || "ACTIVE") === "ACTIVE";
+    const isDeleted = file.file_status === "DELETED";
+    const isHot = file.is_hot === 1;
+    return `
+        <section class="space-y-3">
+            <div class="flex flex-wrap gap-2">
+                ${file.media_type === "video" && isActive ? `<button onclick="playVideo('${file.file_id}')" class="bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold">Play</button>` : ""}
+                <button onclick="toggleHotFromInspector()" class="bg-gray-700 text-white px-3 py-1 rounded text-xs font-semibold">${isHot ? "Unset HOT" : "Set HOT"}</button>
+                ${isActive ? `<button onclick="deleteFromInspector()" class="bg-red-900/50 text-red-200 border border-red-700/50 px-3 py-1 rounded text-xs font-semibold">Delete</button>` : ""}
+                ${isDeleted ? `<button onclick="restoreFromInspector()" class="bg-green-700 text-white px-3 py-1 rounded text-xs font-semibold">Restore</button>` : ""}
+                <button disabled class="bg-gray-900 text-gray-600 border border-gray-800 px-3 py-1 rounded text-xs font-semibold">Purge planned</button>
+            </div>
+            <p class="text-xs text-gray-500">Dangerous actions require confirmation and refresh the current view after completion.</p>
+        </section>`;
+}
+
+function renderLocationsTab() {
+    const locations = currentInspector.file.locations || [];
+    if (!locations.length) return `<p class="text-gray-500">No locations available.</p>`;
+    return `<section class="space-y-2">${locations.map((loc) => `
+        <div class="bg-gray-900 border border-gray-800 rounded p-3 text-sm space-y-1">
+            <div><span class="text-gray-500">Node:</span> <span class="text-cyan-300">${escapeHtml(loc.node_id)}</span></div>
+            <div><span class="text-gray-500">Host:</span> ${escapeHtml(loc.host)}:${escapeHtml(loc.port)}</div>
+            <div><span class="text-gray-500">Type:</span> ${escapeHtml(loc.location_type)} | <span class="text-gray-500">Status:</span> ${escapeHtml(loc.node_status)}</div>
+            <div><span class="text-gray-500">Primary:</span> ${escapeHtml(loc.is_primary)}</div>
+            <div><span class="text-gray-500">Last seen:</span> ${escapeHtml(loc.last_seen || "")}</div>
+            <div class="text-xs text-gray-500 break-all">${escapeHtml(loc.path)}</div>
+        </div>`).join("")}</section>`;
+}
+
+function renderDebugTab() {
+    const endpoints = [
+        `/api/files/${currentInspector.file.file_id}`,
+        `/api/media/files/${currentInspector.file.file_id}`,
+        `/api/files/${currentInspector.file.file_id}/location`,
+    ];
+    return `
+        <section class="space-y-3">
+            <div class="text-xs text-gray-400">Endpoints used: ${endpoints.map(escapeHtml).join(" | ")}</div>
+            <pre class="bg-black/40 border border-gray-800 rounded p-3 text-xs overflow-auto max-h-96">${escapeHtml(JSON.stringify(currentInspector, null, 2))}</pre>
+        </section>`;
+}
+
+function detailRow(label, value) {
+    return `<div class="detail-row"><div class="detail-label">${escapeHtml(label)}</div><div class="detail-value">${escapeHtml(value ?? "")}</div></div>`;
+}
+
+function fieldInput(id, label, value, type = "text") {
+    return `<label class="block text-xs text-gray-400">${escapeHtml(label)}<input id="${id}" type="${type}" value="${escapeHtml(value ?? "")}" class="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-2 py-1 text-gray-100"></label>`;
+}
+
+function fieldSelect(id, label, options, selectedValue) {
+    return fieldSelectHtml(id, label, optionList(options, selectedValue));
+}
+
+function fieldSelectHtml(id, label, optionsHtml, onchange = "") {
+    const changeAttr = onchange ? ` onchange="${escapeHtml(onchange)}"` : "";
+    return `<label class="block text-xs text-gray-400">${escapeHtml(label)}<select id="${id}"${changeAttr} class="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-2 py-1 text-gray-100">${optionsHtml}</select></label>`;
+}
+
+function handleInspectorCollectionChange() {
+    const select = document.getElementById("inspector-collection");
+    const wrap = document.getElementById("inspector-new-collection-wrap");
+    const input = document.getElementById("inspector-new-collection");
+    if (!select || !wrap) return;
+    const isNew = select.value === "__new__";
+    wrap.classList.toggle("hidden", !isNew);
+    if (!isNew && input) input.value = "";
+}
+window.handleInspectorCollectionChange = handleInspectorCollectionChange;
+
+function collectInspectorMediaPayload() {
+    const collectionValue = document.getElementById("inspector-collection")?.value || "";
+    const createNewCollection = collectionValue === "__new__";
+    const collectionId = createNewCollection ? null : readOptionalInt("inspector-collection");
+    const episodeNumber = readOptionalInt("inspector-episode");
+    return {
+        media_kind: document.getElementById("inspector-media-kind")?.value || "unknown",
+        final_media_kind: document.getElementById("inspector-media-kind")?.value || "unknown",
+        title: document.getElementById("inspector-title")?.value.trim(),
+        final_title: document.getElementById("inspector-title")?.value.trim(),
+        collection_id: collectionId,
+        collection_title: createNewCollection ? document.getElementById("inspector-new-collection")?.value.trim() : "",
+        collection_type: document.getElementById("inspector-collection-type")?.value || "unknown",
+        season_number: readOptionalInt("inspector-season"),
+        episode_number: episodeNumber,
+        display_order: episodeNumber,
+        year: readOptionalInt("inspector-year"),
+        language: document.getElementById("inspector-language")?.value.trim(),
+        reviewed_by: "dashboard-dev",
+    };
+}
+
+function setInspectorMediaStatus(message, isError = false) {
+    const el = document.getElementById("inspector-media-status");
+    if (!el) return;
+    el.innerText = message;
+    el.className = isError ? "text-xs text-red-400" : "text-xs text-green-400";
+}
+
+async function saveMediaChanges() {
+    const values = mediaContextValues();
+    if (!values) return;
+    const payload = collectInspectorMediaPayload();
+    if (!payload.title) {
+        setInspectorMediaStatus("Title is required", true);
+        return;
+    }
+    try {
+        const url = values.mode === "draft"
+            ? `${MASTER_URL}/api/media/drafts/${values.id}`
+            : `${MASTER_URL}/api/media/files/${currentInspector.file.file_id}`;
+        const response = await fetch(url, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setInspectorMediaStatus(`Save failed: ${data.error || "unknown error"}`, true);
+            return;
+        }
+        await refreshInspectorData();
+        setInspectorMediaStatus("Changes Saved");
+    } catch (error) {
+        setInspectorMediaStatus(`Save failed: ${error.message || error}`, true);
+    }
+}
+
+async function approveDraftFromInspector() {
+    const values = mediaContextValues();
+    if (!values || values.mode !== "draft") return;
+    await saveMediaChanges();
+    const payload = collectInspectorMediaPayload();
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/drafts/${values.id}/approve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setInspectorMediaStatus(`Approve failed: ${data.error || "unknown error"}`, true);
+            return;
+        }
+        setInspectorMediaStatus("Approved");
+        await refreshInspectorData();
+        await refreshDashboard();
+    } catch (error) {
+        setInspectorMediaStatus(`Approve failed: ${error.message || error}`, true);
+    }
+}
+
+async function rejectDraftFromInspector() {
+    const values = mediaContextValues();
+    if (!values || values.mode !== "draft") return;
+    const reason = prompt("Reject reason", "");
+    if (reason === null) return;
+    await rejectMediaDraft(values.id, { reason, refresh: false });
+    await refreshInspectorData();
+    await refreshDashboard();
+}
+
+async function refreshInspectorData() {
+    if (!currentInspector?.file?.file_id) return;
+    const [file, media] = await Promise.all([
+        fetchJsonOrThrow(`${MASTER_URL}/api/files/${currentInspector.file.file_id}`),
+        fetchJsonOrThrow(`${MASTER_URL}/api/media/files/${currentInspector.file.file_id}`),
+    ]);
+    currentInspector = { file, media };
+    renderFileInspector();
+}
+
+async function toggleHotFromInspector() {
+    await togglePin(currentInspector.file.file_id, currentInspector.file.is_hot === 1, { refresh: false });
+    await refreshInspectorData();
+    await refreshDashboard();
+}
+
+async function deleteFromInspector() {
+    await deleteFile(currentInspector.file.file_id, { refresh: false });
+    closeDetailsModal();
+    await refreshDashboard();
+}
+
+async function restoreFromInspector() {
+    await restoreFile(currentInspector.file.file_id, { refresh: false });
+    closeDetailsModal();
+    await refreshDashboard();
 }
 
 function closeDetailsModal() { document.getElementById("details-modal").classList.add("hidden"); }
 document.getElementById("details-close-btn").addEventListener("click", closeDetailsModal);
 document.getElementById("details-modal").addEventListener("click", (event) => { if (event.target.id === "details-modal") closeDetailsModal(); });
+bindVideoModalEvents();
+
+function setUploadState(message, busy = false) {
+    const status = document.getElementById("upload-status");
+    const fileInput = document.getElementById("file-input");
+    const submitButton = document.querySelector("#upload-form button[type='submit']");
+    if (status) status.innerText = message || "";
+    if (fileInput) fileInput.disabled = busy;
+    if (submitButton) submitButton.disabled = busy;
+    if (submitButton) submitButton.classList.toggle("opacity-60", busy);
+}
+
+async function getStorageNodeStatus() {
+    const response = await fetch(`${NODE_URL}/api/status`);
+    if (!response.ok) return null;
+    return response.json();
+}
+
+function uploadWithProgress(formData, file) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `${NODE_URL}/api/files/cache`);
+        xhr.timeout = 30 * 60 * 1000;
+
+        xhr.upload.addEventListener("progress", (event) => {
+            if (!event.lengthComputable) {
+                setUploadState(`Uploading ${file.name}...`, true);
+                return;
+            }
+            const percent = Math.round((event.loaded / event.total) * 100);
+            setUploadState(`Uploading ${file.name}: ${percent}% (${formatBytes(event.loaded)} / ${formatBytes(event.total)})`, true);
+        });
+
+        xhr.upload.addEventListener("load", () => {
+            setUploadState(`Upload sent. Hashing and registering ${file.name}...`, true);
+        });
+
+        xhr.addEventListener("load", () => {
+            let data = {};
+            try {
+                data = JSON.parse(xhr.responseText || "{}");
+            } catch (error) {
+                data = { error: xhr.responseText || String(error) };
+            }
+            resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data });
+        });
+
+        xhr.addEventListener("error", () => reject(new Error("network error while uploading")));
+        xhr.addEventListener("timeout", () => reject(new Error("upload timed out")));
+        xhr.addEventListener("abort", () => reject(new Error("upload aborted")));
+        xhr.send(formData);
+    });
+}
+
+document.getElementById("upload-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    const fileInput = document.getElementById("file-input");
+    if (!fileInput.files.length) return;
+
+    const file = fileInput.files[0];
+    setUploadState(`Checking storage space for ${file.name}...`, true);
+
+    try {
+        const nodeStatus = await getStorageNodeStatus();
+        if (nodeStatus && file.size > Number(nodeStatus.shared_space_free_bytes || 0)) {
+            setUploadState(`Not enough Shared Space. File: ${formatBytes(file.size)}, free: ${formatBytes(nodeStatus.shared_space_free_bytes)}.`);
+            return;
+        }
+    } catch (error) {
+        setUploadState("Could not check storage space. Uploading anyway...", true);
+    }
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("owner", "Web_UI_User");
+    formData.append("location_type", "CACHED");
+
+    try {
+        const { ok, status, data } = await uploadWithProgress(formData, file);
+        if (ok) {
+            setUploadState(`Uploaded ${file.name}.`);
+            fileInput.value = "";
+            refreshDashboard();
+            alert(`Upload complete. Type: ${data.media_type || "unknown"}`);
+            return;
+        }
+
+        const details = data.free_bytes !== undefined
+            ? ` Free: ${formatBytes(data.free_bytes)}, incoming: ${formatBytes(data.incoming_bytes)}.`
+            : "";
+        setUploadState(`Upload failed (${status}): ${data.error || "unknown error"}.${details}`);
+        alert(`Upload failed (${status}): ${data.error || "unknown error"}`);
+    } catch (error) {
+        setUploadState(`Upload failed: ${error.message || error}`);
+        alert(`Upload failed: ${error.message || error}`);
+    } finally {
+        const status = document.getElementById("upload-status");
+        setUploadState(status ? status.innerText : "", false);
+    }
+});
 
 document.getElementById("upload-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -197,6 +1094,16 @@ document.getElementById("upload-form").addEventListener("submit", async (event) 
     }
 });
 
-function refreshDashboard() { fetchSystemStatus(); fetchFilesList(); }
+function refreshDashboard() {
+    fetchSystemStatus();
+    renderViewControls();
+    updateViewButtons();
+    if (currentView === 'media_review' && isEditingMediaDraft()) return;
+    if (currentView === 'deleted') fetchDeletedFiles();
+    else if (currentView === 'media_review') fetchMediaDrafts();
+    else if (currentView === 'media_library') fetchMediaLibrary();
+    else fetchFilesList();
+}
+renderViewControls();
 refreshDashboard();
 setInterval(refreshDashboard, 4000);

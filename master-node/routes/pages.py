@@ -6,11 +6,7 @@ def create_pages_blueprint():
 
     @bp.route("/")
     def index():
-        return jsonify({
-            "service": "FSYS Master Registry",
-            "version": "2.0.0-hybrid-registry",
-            "status": "running",
-        })
+        return render_template("viewer.html")
 
     @bp.route("/dashboard")
     def dashboard():

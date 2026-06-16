@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FSYS Home</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+    <nav class="sticky top-0 z-40 bg-gray-950/95 border-b border-gray-800 backdrop-blur">
+        <div class="max-w-7xl mx-auto px-5 py-4 flex flex-wrap items-center justify-between gap-3">
+            <a href="/" class="text-xl font-bold tracking-wide text-cyan-300">FSYS Home</a>
+            <div class="flex flex-wrap gap-2 text-sm">
+                <button class="viewer-nav is-active px-3 py-1 rounded bg-cyan-600 text-white" data-section="home">Home</button>
+                <button class="viewer-nav px-3 py-1 rounded text-gray-300 hover:text-white hover:bg-gray-800" data-section="movies">Movies</button>
+                <button class="viewer-nav px-3 py-1 rounded text-gray-300 hover:text-white hover:bg-gray-800" data-section="series">Series</button>
+                <button class="viewer-nav px-3 py-1 rounded text-gray-300 hover:text-white hover:bg-gray-800" data-section="anime">Anime</button>
+                <button class="viewer-nav px-3 py-1 rounded text-gray-300 hover:text-white hover:bg-gray-800" data-section="clips">Clips</button>
+                <button class="viewer-nav px-3 py-1 rounded text-gray-300 hover:text-white hover:bg-gray-800" data-section="courses">Courses</button>
+                <a href="/dashboard" class="px-3 py-1 rounded border border-gray-700 text-gray-300 hover:text-white hover:border-cyan-500">Admin Dashboard</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-5 py-8 space-y-8">
+        <section>
+            <p id="viewer-kicker" class="text-sm text-cyan-300 font-semibold">Home Media Server</p>
+            <h1 id="viewer-title" class="text-3xl md:text-4xl font-bold mt-2">Recently Added</h1>
+            <p id="viewer-subtitle" class="text-gray-400 mt-2">Approved media from your FSYS library.</p>
+        </section>
+
+        <section id="viewer-content" class="space-y-8">
+            <div class="text-gray-500">Loading media library...</div>
+        </section>
+    </main>
+
+    <div id="viewer-video-modal" class="hidden fixed inset-0 z-50 bg-black/85 p-4">
+        <div class="max-w-5xl mx-auto mt-8 bg-gray-950 border border-gray-800 shadow-2xl overflow-hidden">
+            <div class="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+                <h3 id="viewer-video-title" class="font-bold text-gray-100">Video</h3>
+                <button id="viewer-video-close" class="text-gray-400 hover:text-white text-xl">x</button>
+            </div>
+            <video id="viewer-video-player" class="w-full bg-black max-h-[78vh]" controls autoplay></video>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/viewer.js') }}?v=0.7.0"></script>
+</body>
+</html>
