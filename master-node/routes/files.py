@@ -224,6 +224,37 @@ def create_files_blueprint(db):
             return jsonify({"status": "updated", "file_id": str(file_id), "is_hot": int(data.get("is_hot", 1))}), 200
         return jsonify({"error": "File not found"}), 404
 
+    @bp.route("/files/<file_id>/storage/promote-to-cache", methods=["POST"])
+    def request_promote_to_cache(file_id):
+        if not require_node_token():
+            return jsonify({"error": "Unauthorized"}), 401
+
+        data = request.get_json(silent=True) or {}
+        result = db.create_promote_to_cache_operation(
+            file_id=file_id,
+            requested_by=data.get("requested_by", "dashboard-dev"),
+        )
+        status = result.get("status")
+        if result.get("created"):
+            return jsonify(result), 202
+        if status == "not_found":
+            return jsonify(result), 404
+        if status in {"already_cached", "already_queued"}:
+            return jsonify(result), 409
+        return jsonify(result), 400
+
+    @bp.route("/storage/operations/<operation_id>", methods=["GET"])
+    def get_storage_operation(operation_id):
+        operation = db.get_storage_operation(operation_id)
+        if not operation:
+            return jsonify({"error": "Storage operation not found", "operation_id": operation_id}), 404
+        return jsonify(operation), 200
+
+    @bp.route("/storage/operations", methods=["GET"])
+    def list_storage_operations():
+        operations = db.list_storage_operations(file_id=request.args.get("file_id"))
+        return jsonify({"count": len(operations), "operations": operations}), 200
+
 
     @bp.route("/files/<file_id>", methods=["DELETE"])
     def delete_file(file_id):
@@ -362,6 +393,7 @@ def create_files_blueprint(db):
                     "action": "local_reactivated",
                     "reason": "LOCAL/original files require DB reactivation only"
                 })
+                successful_nodes += 1
                 continue
 
             if not host or not port or node_status != "ONLINE":

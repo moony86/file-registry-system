@@ -42,6 +42,45 @@
         </section>
 
         <section class="bg-gray-800 border border-gray-700 rounded-xl shadow-lg p-6">
+            <h3 class="text-lg font-bold text-gray-200 mb-4">Add Local File(s)</h3>
+            <div class="flex flex-wrap gap-2 mb-4">
+                <button id="local-mode-manual" type="button" class="bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold">Manual Paths</button>
+                <button id="local-mode-browse" type="button" class="bg-gray-900 text-gray-300 border border-gray-700 px-3 py-1 rounded text-xs font-semibold">Browse Libraries</button>
+            </div>
+            <form id="local-register-form" class="space-y-3">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <label class="text-xs text-gray-400">Storage Node
+                        <select id="local-node-select" class="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-2 py-2 text-gray-100"></select>
+                    </label>
+                    <label class="text-xs text-gray-400">Owner
+                        <input id="local-owner-input" value="Web_UI_User" class="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-2 py-2 text-gray-100">
+                    </label>
+                    <div class="flex items-end">
+                        <button type="submit" class="bg-cyan-700 hover:bg-cyan-600 text-white px-4 py-2 rounded text-sm font-semibold">Register</button>
+                    </div>
+                </div>
+                <label class="block text-xs text-gray-400">Paths on selected node, one per line
+                    <textarea id="local-paths-input" rows="4" class="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-3 py-2 text-gray-100 font-mono text-xs" placeholder="D:/Movies/video01.mp4"></textarea>
+                </label>
+                <div id="local-register-status" class="text-xs text-gray-400 space-y-1"></div>
+            </form>
+            <div id="local-browse-panel" class="hidden space-y-3">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <label class="text-xs text-gray-400">Library
+                        <select id="local-library-select" class="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-2 py-2 text-gray-100"></select>
+                    </label>
+                    <div class="flex items-end gap-2">
+                        <button id="local-browse-back" type="button" class="bg-gray-900 text-gray-300 border border-gray-700 px-3 py-2 rounded text-xs font-semibold">Back</button>
+                        <button id="local-add-selected" type="button" class="bg-cyan-700 hover:bg-cyan-600 text-white px-3 py-2 rounded text-xs font-semibold">Add Selected</button>
+                    </div>
+                </div>
+                <div id="local-browse-path" class="text-xs text-gray-500 font-mono"></div>
+                <div id="local-browse-list" class="border border-gray-700 rounded overflow-hidden divide-y divide-gray-800"></div>
+                <div id="local-browse-status" class="text-xs text-gray-400 space-y-1"></div>
+            </div>
+        </section>
+
+        <section class="bg-gray-800 border border-gray-700 rounded-xl shadow-lg p-6">
             <h3 class="text-lg font-bold text-gray-200 mb-4 flex items-center gap-2"><span>🖥️</span> الخوادم الفرعية المتصلة (Storage Nodes)</h3>
             <div class="overflow-x-auto"><table class="w-full text-right text-sm">
                 <thead><tr class="border-b border-gray-700 text-gray-400 font-medium"><th class="pb-3">Node ID</th><th class="pb-3">العنوان (Host:Port)</th><th class="pb-3">المساحة المشتركة</th><th class="pb-3">حالة الاتصال</th></tr></thead>
@@ -78,6 +117,6 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='js/dashboard.js') }}?v=0.7.2"></script>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}?v=0.8.1"></script>
 </body>
 </html>

@@ -1,400 +1,244 @@
-FSYS v0.7.3 – Immersive Viewing Experience / Cinema Mode
+FSYS v0.8.3 – Windows Portable Node Package
 
 الهدف:
-تحسين تجربة المشاهدة في FSYS وتحويل التشغيل من مجرد video داخل Modal إلى تجربة Home Theater حقيقية.
+تجهيز Storage Node كحزمة Portable على Windows، تعمل بدون VS Code وبدون خطوات كثيرة.
 
-لا تضف:
-- AI
-- Recommendations
-- Watch History
-- Continue Watching
-- User Accounts
-- Comments
-- Chat
-- Scraping
-- TMDB / Anilist
-- تغيير Streaming Backend
-- تغيير Subtitle Backend
-- تغيير Upload/Delete/Restore
+السياق:
+v0.8.2 يدعم:
+- LOCAL register
+- Browse Local Library
+- CACHED upload
+- Promote LOCAL→CACHED via operation queue
+- runtime hardening
+- master fallback
+- auto identity
 
-المطلوب فقط:
-واجهة مشاهدة مستقلة ومريحة للمستخدم.
-
-==================================================
-السياق
-==================================================
-
-FSYS حالياً يدعم:
-- Upload
-- Media Library
-- Streaming
-- Subtitles
-- Thumbnails
-- ffprobe metadata
-- Delete/Restore
-- File Inspector
-
-المشكلة:
-التشغيل الحالي يعمل، لكنه لا يعطي تجربة مشاهدة مريحة.
-المطلوب إنشاء صفحة مشاهدة مخصصة.
+ممنوع:
+- لا تضف Windows Service الآن.
+- لا تضف HOT.
+- لا تضف replication.
+- لا تعيد كتابة Go.
+- لا تغير Upload/Stream/Media.
+- لا تكسر تشغيل Python الحالي.
 
 ==================================================
-1) Watch Page
+1) Build Script
 ==================================================
 
-أضف صفحة جديدة:
+أضف سكربت:
 
-GET /watch/<file_id>
+scripts/build_windows_node.ps1
 
-أو route مناسب داخل Master.
+يقوم بـ:
+- تنظيف dist القديم الخاص بالنود فقط.
+- تشغيل PyInstaller بـ onedir.
+- إخراج الحزمة في:
+  dist/FSYSNode/
 
-هذه الصفحة ليست Dashboard.
+المطلوب داخل الحزمة:
+- fsys-node.exe
+- start_node.bat
+- check_status.bat
+- .env.example
+- README_NODE_WINDOWS.md
+- مجلدات فارغة:
+  data/
+  shared_space/
+  thumbnails/
+  logs/
 
-يجب أن تكون:
-- Dark
-- Clean
-- Fullscreen-friendly
-- بدون جداول
-- بدون أدوات إدارة
-
-عند فتحها:
-- تجلب بيانات الملف
-- تجلب media metadata
-- تجلب subtitles
-- تبني stream URL من node
-- تعرض video player
-
-==================================================
-2) Cinema Mode UI
-==================================================
-
-التصميم:
-
-- خلفية سوداء أو قريبة من الأسود.
-- الفيديو في الوسط.
-- معلومات بسيطة فوق أو تحت الفيديو.
-- لا تعرض hashes أو paths أو node info.
-- زر Back to Library.
-- زر Back to Dashboard اختياري صغير.
-
-إذا يوجد thumbnail:
-استخدمه كخلفية ambient:
-- blurred
-- dark overlay
-- brightness منخفض
-
-إذا لا يوجد thumbnail:
-خلفية سوداء عادية.
+لا تضع ملفات runtime حقيقية داخل Git.
 
 ==================================================
-3) Video Info
+2) PyInstaller
 ==================================================
 
-اعرض فوق أو أسفل الفيديو:
+استخدم onedir وليس onefile.
 
-- Title
-- Collection title إن وجد
-- Season/Episode إن وجد
-- Duration إن وجد
-- Resolution إن وجد
-- Codec بشكل خفيف إن وجد
+السبب:
+- أسهل في debug.
+- أسهل مع ملفات config.
+- أفضل كبداية.
+
+تأكد من hidden imports إذا احتجت:
+- flask
+- flask_cors
+- requests
+- dotenv
+- pg8000 إن كان مطلوباً للنود فقط لا تضفه إذا ليس مطلوباً
+- services.*
+- routes.*
+
+لا تضف master-node داخل package.
+
+==================================================
+3) Portable config
+==================================================
+
+داخل package:
+
+.env.example
+
+يحتوي:
+
+NODE_ID=auto
+NODE_HOST=auto
+NODE_PORT=5001
+
+MASTER_URLS=http://192.168.1.14:5000,http://localhost:5000
+FSYS_NODE_TOKEN=dev-token
+
+SHARED_SPACE_ENABLED=true
+SHARED_SPACE_DIR=./shared_space
+SHARED_SPACE_LIMIT_BYTES=21474836480
+
+THUMBNAILS_DIR=./thumbnails
+DATA_DIR=./data
+
+LOCAL_LIBRARY_DIRS=
+
+FSYS_CORS_ORIGINS=http://192.168.1.14:5000,http://localhost:5000,http://127.0.0.1:5000
+
+==================================================
+4) First run behavior
+==================================================
+
+إذا .env غير موجود بجانب exe:
+- انسخ .env.example إلى .env
+- لا تسأل المستخدم الآن.
+- اطبع رسالة واضحة:
+  Created .env from .env.example. Please edit MASTER_URLS and LOCAL_LIBRARY_DIRS if needed.
+
+هذا يجعل التشغيل الأول لا ينهار.
+
+==================================================
+5) start_node.bat
+==================================================
+
+ينفذ:
+
+fsys-node.exe
+
+ويترك النافذة مفتوحة حتى يقرأ المستخدم الأخطاء.
 
 مثال:
-
-Yofukashi no Uta
-Season 1 • Episode 3
-1080p • 23m
-
-لا تعرض تفاصيل تقنية كثيرة.
+@echo off
+cd /d "%~dp0"
+fsys-node.exe
+pause
 
 ==================================================
-4) Player
+6) check_status.bat
 ==================================================
 
-استخدم stream endpoint الحالي.
-لا تغير backend.
+ينفذ:
 
-يجب أن يدعم:
-- subtitles الحالية
-- controls
-- fullscreen
-- playback speed
-- volume persistence
+curl http://127.0.0.1:5001/api/status
 
-عند تحميل الصفحة:
-- GET /api/files/<file_id>
-- GET /api/media/files/<file_id>
-- GET /api/media/files/<file_id>/subtitles
-- GET /api/files/<file_id>/location لبناء stream URL إن كان مطلوباً
-
-ثم:
-
-video.src = http://node-host:node-port/api/files/<file_id>/stream
+أو PowerShell Invoke-WebRequest إذا curl غير متاح.
 
 ==================================================
-5) Subtitles
+7) Logging
 ==================================================
 
-إذا توجد ترجمة active ومدعومة:
-أضف <track> داخل video.
+أضف logging أساسي إن لم يكن موجوداً:
+- logs/node.log
+- لا تكسر current console output.
+- يكفي logging.basicConfig في app.py أو helper بسيط.
 
-لكل subtitle:
-src = /api/media/subtitles/<subtitle_id>/file
-label = label أو language
-srclang = language code إن أمكن
-default إذا is_default = true
-
-أضف خيار بسيط لعرض اللغات:
-- Arabic
-- English
-- Off
-
-إذا HTML5 controls كافية، لا تبالغ.
+لا تبالغ.
 
 ==================================================
-6) Keyboard Shortcuts
+8) Path safety
 ==================================================
 
-أضف shortcuts:
+تأكد أن config paths النسبية:
+./shared_space
+./thumbnails
+./data
+./logs
 
-Space:
-Play/Pause
+تُحل بالنسبة لمجلد التشغيل الحالي بجانب exe.
 
-ArrowRight:
-+10 seconds
-
-ArrowLeft:
--10 seconds
-
-F:
-Fullscreen
-
-M:
-Mute/Unmute
-
-Escape:
-إذا fullscreen اخرج منه
-
-لا تجعل الاختصارات تعمل عندما المستخدم يكتب داخل input.
+مهم جداً:
+عند تشغيل exe من dist/FSYSNode، لا تجعل shared_space يتولد داخل System32 أو مكان غريب.
 
 ==================================================
-7) Playback Settings LocalStorage
+9) Documentation
 ==================================================
 
-احفظ محلياً:
+أضف:
 
-- volume
-- muted
-- playbackRate
-- selectedSubtitle إن أمكن
+docs/WINDOWS_NODE_PACKAGE.md
 
-LocalStorage keys تكون مثل:
-
-fsys.player.volume
-fsys.player.muted
-fsys.player.rate
-fsys.player.subtitle
-
-لا تحفظ watch position الآن.
-هذا مؤجل لـ Continue Watching.
+يشرح:
+- كيف تبني الحزمة.
+- أين تجد dist/FSYSNode.
+- كيف تعدل .env.
+- كيف تشغل start_node.bat.
+- كيف تختبر check_status.bat.
+- كيف تفتح Firewall للبورت 5001.
+- أن Windows Service مؤجل.
 
 ==================================================
-8) Playback Speed
+10) Acceptance Tests
 ==================================================
 
-أضف selector بسيط:
+بعد التنفيذ:
 
-0.5x
-1x
-1.25x
-1.5x
-2x
+A) Build:
+- شغل scripts/build_windows_node.ps1
+- تأكد dist/FSYSNode موجود.
 
-عند التغيير:
-- video.playbackRate = value
-- احفظها في LocalStorage
+B) Files:
+داخل dist/FSYSNode يجب وجود:
+- fsys-node.exe
+- .env.example
+- start_node.bat
+- check_status.bat
+- README_NODE_WINDOWS.md
+- data/
+- shared_space/
+- thumbnails/
+- logs/
 
-==================================================
-9) Next / Previous Episode
-==================================================
+C) First run:
+- احذف .env من dist/FSYSNode.
+- شغل start_node.bat.
+- يجب أن ينشئ .env.
+- لا ينهار.
 
-إذا الملف الحالي جزء من media_item داخل collection:
+D) Status:
+- check_status.bat يرجع /api/status.
 
-اعثر على:
-- previous episode
-- next episode
+E) Master fallback:
+- ضع MASTER_URLS برابط أول فاشل وثاني صحيح.
+- شغل النود.
+- active_master_url ينتقل للرابط الصحيح.
 
-المنطق:
-نفس collection_id
-نفس season_number
-episode_number - 1
-episode_number + 1
+F) Upload:
+- جرّب Upload صغير من dashboard.
+- CACHED يعمل.
 
-إذا لا توجد API حالية:
-أضف endpoint صغير في master-node/routes/media.py:
-
-GET /api/media/files/<file_id>/neighbors
-
-يرجع:
-
-{
-  "previous": {
-    "file_id": "...",
-    "title": "...",
-    "episode_number": 1
-  },
-  "next": {
-    "file_id": "...",
-    "title": "...",
-    "episode_number": 3
-  }
-}
-
-إذا الملف movie أو clip:
-previous/next = null
-
-في Watch Page:
-أظهر:
-← Previous Episode
-Next Episode →
+G) Local:
+- ضع LOCAL_LIBRARY_DIRS في .env.
+- جرّب Browse/Add Local.
+- Play يعمل.
 
 ==================================================
-10) End-of-Episode Prompt
-==================================================
-
-اختياري إذا سهل:
-
-عندما يصل الفيديو إلى آخر 30 ثانية وكان next موجود:
-
-أظهر:
-Next Episode
-
-زر:
-Play Next
-
-لا تضف autoplay إلزامي.
-لا تعمل autoplay countdown معقد.
-
-إذا صعب:
-أجله واذكر أنه مؤجل.
-
-==================================================
-11) Navigation
-==================================================
-
-زر واضح:
-
-Back to Library
-
-يحاول الرجوع إلى:
-- collection page إن كانت موجودة
-- أو /anime
-- أو /
-- أو history.back()
-
-لا تكسر إذا لا يوجد source.
-
-==================================================
-12) Viewer Integration
-==================================================
-
-أي زر Play في Viewer أو Media Library يجب أن يفتح:
-
-/watch/<file_id>
-
-بدل modal القديم، أو يمكن ترك modal في Dashboard فقط.
-
-المطلوب:
-- Viewer user experience تستخدم watch page.
-- Admin Dashboard يمكن أن يبقى يستخدم modal أو watch page، اختر الأبسط.
-
-==================================================
-13) Mobile
-==================================================
-
-اجعل الصفحة responsive:
-
-- الفيديو يأخذ العرض الكامل تقريباً.
-- الأزرار تحت الفيديو.
-- النصوص لا تزاحم الفيديو.
-
-==================================================
-14) ملفات متوقعة للتعديل
-==================================================
-
-Master:
-- master-node/app.py أو routes/pages.py إن وجدت
-- master-node/templates/watch.html جديد
-- master-node/static/js/watch.js جديد
-- master-node/static/css/watch.css إن كان المشروع يستخدم CSS منفصل
-- master-node/routes/media.py لإضافة neighbors endpoint إن احتجت
-- master-node/static/js/viewer.js لتغيير Play links إلى /watch/<file_id>
-- master-node/static/js/dashboard.js فقط إذا لازم
-
-لا تعدل Storage Node.
-
-==================================================
-15) اختبارات القبول
-==================================================
-
-اختبر:
-
-1. فتح:
-/watch/<file_id>
-
-2. الفيديو يشتغل.
-
-3. الخلفية مظلمة ومريحة.
-
-4. subtitle تظهر إذا كانت موجودة.
-
-5. Space يشغل/يوقف.
-
-6. ArrowRight/ArrowLeft تقدم وترجع 10 ثواني.
-
-7. F fullscreen.
-
-8. M mute.
-
-9. تغيير السرعة يبقى بعد refresh.
-
-10. إذا الحلقة لها next:
-زر Next Episode يعمل.
-
-11. إذا الحلقة لها previous:
-زر Previous Episode يعمل.
-
-12. Play من Viewer يفتح watch page.
-
-13. Play لا ينكسر في Dashboard.
-
-==================================================
-16) ممنوع
-==================================================
-
-لا تضف:
-- Continue Watching
-- Watch progress
-- Database tracking للمشاهدة
-- Users
-- Profiles
-- Recommendations
-- External metadata
-- Player library خارجية مثل video.js حالياً
-
-استخدم HTML5 video.
-
-==================================================
-17) Output المطلوب
+Output المطلوب
 ==================================================
 
 بعد التنفيذ أعطني:
-
-1. الملفات المعدلة والجديدة.
-2. route الجديد للـ watch page.
-3. هل أضفت neighbors API.
-4. الاختصارات المدعومة.
-5. LocalStorage keys المستخدمة.
-6. كيف يعمل subtitle داخل watch page.
-7. كيف أختبر next/previous episode.
-8. أي شيء مؤجل.
+1. الملفات الجديدة والمعدلة.
+2. كيف أبني الحزمة.
+3. شكل dist/FSYSNode.
+4. هل .env auto-created يعمل.
+5. كيف أختبر status.
+6. هل احتجت hidden imports.
+7. أي مشاكل PyInstaller ظهرت.
+8. TODO مؤجل:
+   - Windows Service
+   - Setup Wizard
+   - Auto update
+   - Signed installer

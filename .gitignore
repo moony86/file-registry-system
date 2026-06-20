@@ -1,18 +1,16 @@
 venv/
-.env
-
 __pycache__/
 *.pyc
-shared_space/
-# runtime storage
+
+.env
+*.log
+
 shared_space/
 trash/
-
-# generated thumbnails
+storage-node/data/
 storage-node/thumbnails/
-
-# uploaded subtitles
 master-node/subtitles/
 
-# optional
-*.log
+build/
+dist/
+*.spec

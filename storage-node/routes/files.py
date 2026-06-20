@@ -32,6 +32,9 @@ def create_files_blueprint(config, space_cache, master_client):
 
     @bp.route("/register", methods=["POST"])
     def register_local_file():
+        if not require_node_token():
+            return jsonify({"error": "Unauthorized"}), 401
+
         data = request.get_json(silent=True) or {}
         try:
             source_path = safe_existing_file_path(data.get("physical_path", ""))
@@ -337,6 +340,90 @@ def create_files_blueprint(config, space_cache, master_client):
                 except Exception:
                     current_app.logger.exception("Failed to clean up unregistered shared-space file: %s", final_path)
             return jsonify({"error": str(exc)}), 500
+
+    @bp.route("/<file_id>/promote-to-cache", methods=["POST"])
+    def promote_local_to_cache(file_id):
+        if not require_node_token():
+            return jsonify({"error": "Unauthorized"}), 401
+        if not config.SHARED_SPACE_ENABLED:
+            return jsonify({"error": "Shared Space is disabled on this node"}), 409
+
+        data = request.get_json(silent=True) or {}
+        content_hash = data.get("content_hash")
+        raw_path = data.get("physical_path")
+        file_name = Path(data.get("file_name") or "cached.bin").name
+        if not content_hash or not raw_path:
+            return jsonify({"error": "Missing content_hash or physical_path"}), 400
+
+        temp_path = None
+        final_path = None
+        try:
+            source_path = Path(raw_path).expanduser().resolve()
+            if not source_path.exists() or not source_path.is_file():
+                return jsonify({"error": f"Source file not found: {raw_path}"}), 404
+
+            actual_hash = sha256_file(source_path)
+            if actual_hash != content_hash:
+                return jsonify({
+                    "error": "Source checksum mismatch",
+                    "expected": content_hash,
+                    "actual": actual_hash,
+                }), 409
+
+            size_bytes = source_path.stat().st_size
+            final_path = path_for_hash(config.SHARED_SPACE_DIR, content_hash, file_name)
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if final_path.exists():
+                existing_hash = sha256_file(final_path)
+                if existing_hash != content_hash:
+                    return jsonify({
+                        "error": "Existing cached file hash mismatch",
+                        "expected": content_hash,
+                        "actual": existing_hash,
+                    }), 409
+                return jsonify({
+                    "status": "already_cached",
+                    "shared_space_path": str(final_path),
+                    "size_bytes": final_path.stat().st_size,
+                }), 200
+
+            if space_cache.used() + size_bytes > config.SHARED_SPACE_LIMIT_BYTES:
+                return jsonify({
+                    "error": "Shared Space quota exceeded",
+                    "used_bytes": space_cache.used(),
+                    "limit_bytes": config.SHARED_SPACE_LIMIT_BYTES,
+                    "incoming_bytes": size_bytes,
+                }), 507
+
+            temp_path = final_path.with_name(f".promote-{time.time_ns()}-{final_path.name}")
+            shutil.copy2(source_path, temp_path)
+
+            copied_hash = sha256_file(temp_path)
+            if copied_hash != content_hash:
+                temp_path.unlink(missing_ok=True)
+                return jsonify({
+                    "error": "Checksum mismatch after copy",
+                    "expected": content_hash,
+                    "actual": copied_hash,
+                }), 409
+
+            shutil.move(str(temp_path), str(final_path))
+            space_cache.add(size_bytes)
+
+            return jsonify({
+                "status": "cached",
+                "shared_space_path": str(final_path),
+                "size_bytes": size_bytes,
+            }), 200
+        except Exception:
+            current_app.logger.exception("Promote LOCAL to CACHED failed for file_id=%s", file_id)
+            if temp_path:
+                try:
+                    Path(temp_path).unlink(missing_ok=True)
+                except Exception:
+                    current_app.logger.exception("Failed to clean promote temp file: %s", temp_path)
+            return jsonify({"error": "Promote to cache failed"}), 500
 
     @bp.route("/thumbnails/<content_hash>", methods=["GET"])
     def serve_thumbnail(content_hash):

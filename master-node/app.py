@@ -1,4 +1,5 @@
 import os
+import logging
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -9,6 +10,7 @@ from routes.nodes import create_nodes_blueprint
 from routes.pages import create_pages_blueprint
 from routes.status import create_status_blueprint
 from services.cleanup import start_dead_node_cleanup
+from services.storage_operations import start_storage_operations_worker
 
 load_dotenv()
 
@@ -24,6 +26,10 @@ def create_app() -> Flask:
     app.register_blueprint(create_status_blueprint(db))
 
     start_dead_node_cleanup(db)
+    try:
+        start_storage_operations_worker(db)
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to start storage operations worker")
     return app
 
 

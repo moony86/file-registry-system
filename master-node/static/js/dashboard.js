@@ -1,6 +1,7 @@
 const MASTER_URL = window.location.origin;
 const NODE_URL = "http://localhost:5001";
 const ADMIN_TOKEN = "dev-token";
+let onlineStorageNodes = [];
 
 function escapeHtml(value) {
     return String(value ?? "")
@@ -75,6 +76,8 @@ async function fetchSystemStatus() {
     try {
         const response = await fetch(`${MASTER_URL}/api/status`);
         const data = await response.json();
+        onlineStorageNodes = data.nodes || [];
+        renderLocalNodeOptions();
         document.getElementById("active-nodes-count").innerText = data.online_nodes || 0;
         const nodesTable = document.getElementById("nodes-table-body");
         nodesTable.innerHTML = "";
@@ -98,6 +101,14 @@ let mediaCollections = [];
 const draftSaveTimers = {};
 let currentInspector = null;
 let currentInspectorTab = "overview";
+let localRegisterMode = "manual";
+let localLibraries = [];
+let localBrowseState = {
+    libraryId: "",
+    relativePath: "",
+    parentPath: "",
+    selected: new Map(),
+};
 
 const MEDIA_KIND_OPTIONS = [
     "movie",
@@ -318,6 +329,266 @@ async function fetchMediaLibrary() {
 function setLibraryKind(kind) {
     currentLibraryKind = kind;
     fetchMediaLibrary();
+}
+
+function renderLocalNodeOptions() {
+    const select = document.getElementById("local-node-select");
+    if (!select) return;
+    const currentValue = select.value;
+    select.innerHTML = (onlineStorageNodes || []).map((node) => {
+        const value = `${node.host}:${node.port}`;
+        const label = `${node.node_id} (${node.host}:${node.port})`;
+        return `<option value="${escapeHtml(value)}" data-host="${escapeHtml(node.host)}" data-port="${escapeHtml(node.port)}" ${value === currentValue ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    }).join("");
+    if (!select.innerHTML) {
+        select.innerHTML = `<option value="">No online nodes</option>`;
+    }
+    if (!select.dataset.bound) {
+        select.addEventListener("change", () => {
+            localBrowseState.libraryId = "";
+            localBrowseState.relativePath = "";
+            localBrowseState.selected.clear();
+            if (localRegisterMode === "browse") loadLocalLibraries();
+        });
+        select.dataset.bound = "true";
+    }
+}
+
+function setLocalRegisterStatus(rows) {
+    const status = document.getElementById("local-register-status");
+    if (!status) return;
+    status.innerHTML = rows.join("");
+}
+
+function appendLocalRegisterStatus(message, isError = false) {
+    const status = document.getElementById("local-register-status");
+    if (!status) return;
+    status.insertAdjacentHTML("beforeend", `<div class="${isError ? "text-red-400" : "text-gray-300"}">${escapeHtml(message)}</div>`);
+}
+
+async function registerLocalPathOnNode(node, path, owner) {
+    const response = await fetch(`http://${node.host}:${node.port}/api/files/register-local`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-FSYS-Token": ADMIN_TOKEN },
+        body: JSON.stringify({ physical_path: path, owner }),
+    });
+    const data = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, data };
+}
+
+async function handleLocalRegisterSubmit(event) {
+    event.preventDefault();
+    const select = document.getElementById("local-node-select");
+    const pathsInput = document.getElementById("local-paths-input");
+    const ownerInput = document.getElementById("local-owner-input");
+    const selectedNode = onlineStorageNodes.find((node) => `${node.host}:${node.port}` === select?.value);
+    const paths = (pathsInput?.value || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    const owner = ownerInput?.value.trim() || "Web_UI_User";
+
+    if (!selectedNode) {
+        setLocalRegisterStatus([`<div class="text-red-400">Choose an online node first.</div>`]);
+        return;
+    }
+    if (!paths.length) {
+        setLocalRegisterStatus([`<div class="text-red-400">Enter at least one path.</div>`]);
+        return;
+    }
+
+    setLocalRegisterStatus(paths.map((path) => `<div class="text-gray-500">${escapeHtml(path)} - queued</div>`));
+    let okCount = 0;
+    let failCount = 0;
+    const rows = [];
+    for (const path of paths) {
+        try {
+            const result = await registerLocalPathOnNode(selectedNode, path, owner);
+            if (result.ok) {
+                okCount += 1;
+                rows.push(`<div class="text-green-400">${escapeHtml(path)} - success file_id=${escapeHtml(result.data.file_id || "")} location_type=${escapeHtml(result.data.location_type || "LOCAL")}</div>`);
+            } else {
+                failCount += 1;
+                rows.push(`<div class="text-red-400">${escapeHtml(path)} - failed HTTP ${result.status}: ${escapeHtml(result.data.error || "unknown error")}</div>`);
+            }
+        } catch (error) {
+            failCount += 1;
+            rows.push(`<div class="text-red-400">${escapeHtml(path)} - failed: ${escapeHtml(error.message || error)}</div>`);
+        }
+        setLocalRegisterStatus(rows);
+    }
+    appendLocalRegisterStatus(`Add Local batch finished. Success: ${okCount}, failed: ${failCount}.`);
+    if (okCount > 0) {
+        pathsInput.value = "";
+        refreshDashboard();
+    }
+}
+
+function selectedLocalNode() {
+    const select = document.getElementById("local-node-select");
+    return onlineStorageNodes.find((node) => `${node.host}:${node.port}` === select?.value);
+}
+
+function setLocalMode(mode) {
+    localRegisterMode = mode;
+    const manualForm = document.getElementById("local-register-form");
+    const browsePanel = document.getElementById("local-browse-panel");
+    const manualButton = document.getElementById("local-mode-manual");
+    const browseButton = document.getElementById("local-mode-browse");
+    if (manualForm) manualForm.classList.toggle("hidden", mode !== "manual");
+    if (browsePanel) browsePanel.classList.toggle("hidden", mode !== "browse");
+    if (manualButton) manualButton.className = mode === "manual"
+        ? "bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold"
+        : "bg-gray-900 text-gray-300 border border-gray-700 px-3 py-1 rounded text-xs font-semibold";
+    if (browseButton) browseButton.className = mode === "browse"
+        ? "bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold"
+        : "bg-gray-900 text-gray-300 border border-gray-700 px-3 py-1 rounded text-xs font-semibold";
+    if (mode === "browse") loadLocalLibraries();
+}
+
+function setLocalBrowseStatus(message, isError = false) {
+    const status = document.getElementById("local-browse-status");
+    if (!status) return;
+    status.innerHTML = message ? `<div class="${isError ? "text-red-400" : "text-gray-300"}">${escapeHtml(message)}</div>` : "";
+}
+
+function appendLocalBrowseStatus(message, isError = false) {
+    const status = document.getElementById("local-browse-status");
+    if (!status) return;
+    status.insertAdjacentHTML("beforeend", `<div class="${isError ? "text-red-400" : "text-gray-300"}">${escapeHtml(message)}</div>`);
+}
+
+async function fetchNodeJson(node, path) {
+    const response = await fetch(`http://${node.host}:${node.port}${path}`, {
+        headers: { "X-FSYS-Token": ADMIN_TOKEN },
+    });
+    const data = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, data };
+}
+
+async function loadLocalLibraries() {
+    const node = selectedLocalNode();
+    const select = document.getElementById("local-library-select");
+    const list = document.getElementById("local-browse-list");
+    if (!node) {
+        setLocalBrowseStatus("Choose an online node first.", true);
+        if (select) select.innerHTML = "";
+        if (list) list.innerHTML = "";
+        return;
+    }
+    const result = await fetchNodeJson(node, "/api/local/libraries");
+    if (!result.ok) {
+        setLocalBrowseStatus(`Could not load libraries: ${result.data.error || result.status}`, true);
+        return;
+    }
+    localLibraries = result.data.libraries || [];
+    if (select) {
+        select.innerHTML = localLibraries.map((library) => `
+            <option value="${escapeHtml(library.id)}" ${library.id === localBrowseState.libraryId ? "selected" : ""}>
+                ${escapeHtml(library.id)} - ${escapeHtml(library.path)}${library.exists ? "" : " (missing)"}
+            </option>
+        `).join("");
+    }
+    if (!localLibraries.length) {
+        setLocalBrowseStatus("No LOCAL_LIBRARY_DIRS configured on this node.", true);
+        if (list) list.innerHTML = "";
+        return;
+    }
+    if (!localBrowseState.libraryId || !localLibraries.some((library) => library.id === localBrowseState.libraryId)) {
+        localBrowseState.libraryId = localLibraries[0].id;
+        localBrowseState.relativePath = "";
+        localBrowseState.selected.clear();
+    }
+    await browseLocalLibrary(localBrowseState.relativePath);
+}
+
+async function browseLocalLibrary(relativePath = "") {
+    const node = selectedLocalNode();
+    if (!node || !localBrowseState.libraryId) return;
+    const query = new URLSearchParams({
+        library_id: localBrowseState.libraryId,
+        path: relativePath || "",
+    });
+    setLocalBrowseStatus("Loading...");
+    const result = await fetchNodeJson(node, `/api/local/browse?${query.toString()}`);
+    if (!result.ok) {
+        setLocalBrowseStatus(`Browse failed: ${result.data.error || result.status}`, true);
+        return;
+    }
+    localBrowseState.relativePath = result.data.relative_path || "";
+    localBrowseState.parentPath = result.data.parent_path || "";
+    renderLocalBrowseList(result.data);
+    setLocalBrowseStatus("");
+}
+
+function renderLocalBrowseList(data) {
+    const pathEl = document.getElementById("local-browse-path");
+    const list = document.getElementById("local-browse-list");
+    if (pathEl) pathEl.innerText = `${data.base_path}${data.relative_path ? ` / ${data.relative_path}` : ""}`;
+    if (!list) return;
+    const rows = (data.items || []).map((item) => {
+        if (item.type === "directory") {
+            return `
+                <button type="button" onclick="browseLocalLibrary('${escapeJsArg(item.relative_path)}')" class="w-full text-left px-3 py-2 hover:bg-gray-700/40">
+                    <div class="text-gray-200">[DIR] ${escapeHtml(item.name)}</div>
+                    <div class="text-xs text-gray-500">${escapeHtml(item.relative_path)}</div>
+                </button>`;
+        }
+        const checked = localBrowseState.selected.has(item.full_path) ? "checked" : "";
+        return `
+            <label class="flex items-center gap-3 px-3 py-2 hover:bg-gray-700/30" title="${escapeHtml(item.full_path)}">
+                <input type="checkbox" class="local-file-checkbox accent-cyan-600" value="${escapeHtml(item.full_path)}" data-name="${escapeHtml(item.name)}" ${checked}>
+                <div class="min-w-0">
+                    <div class="text-gray-200 truncate">${escapeHtml(item.name)}</div>
+                    <div class="text-xs text-gray-500">${formatBytes(item.size_bytes)} | ${escapeHtml(item.media_type)} | ${escapeHtml(item.mime_type)}</div>
+                </div>
+            </label>`;
+    }).join("");
+    list.innerHTML = rows || `<div class="px-3 py-4 text-gray-500">No files or folders.</div>`;
+    list.querySelectorAll(".local-file-checkbox").forEach((checkbox) => {
+        checkbox.addEventListener("change", () => {
+            if (checkbox.checked) localBrowseState.selected.set(checkbox.value, checkbox.dataset.name || checkbox.value);
+            else localBrowseState.selected.delete(checkbox.value);
+        });
+    });
+}
+
+async function addSelectedLocalFiles() {
+    const node = selectedLocalNode();
+    const owner = document.getElementById("local-owner-input")?.value.trim() || "Web_UI_User";
+    const paths = Array.from(localBrowseState.selected.keys());
+    if (!node) {
+        setLocalBrowseStatus("Choose an online node first.", true);
+        return;
+    }
+    if (!paths.length) {
+        setLocalBrowseStatus("Select at least one file.", true);
+        return;
+    }
+    setLocalBrowseStatus("");
+    let okCount = 0;
+    let failCount = 0;
+    for (const path of paths) {
+        try {
+            const result = await registerLocalPathOnNode(node, path, owner);
+            if (result.ok) {
+                okCount += 1;
+                appendLocalBrowseStatus(`${localBrowseState.selected.get(path)} - success file_id=${result.data.file_id || ""}`);
+            } else {
+                failCount += 1;
+                appendLocalBrowseStatus(`${localBrowseState.selected.get(path)} - failed HTTP ${result.status}: ${result.data.error || "unknown error"}`, true);
+            }
+        } catch (error) {
+            failCount += 1;
+            appendLocalBrowseStatus(`${localBrowseState.selected.get(path)} - failed: ${error.message || error}`, true);
+        }
+    }
+    appendLocalBrowseStatus(`Add Selected finished. Success: ${okCount}, failed: ${failCount}.`);
+    if (okCount > 0) {
+        localBrowseState.selected.clear();
+        await browseLocalLibrary(localBrowseState.relativePath);
+        refreshDashboard();
+    }
 }
 
 async function fetchFilesList() {
@@ -658,14 +929,16 @@ async function showDetails(fileId) {
     content.innerHTML = `<p class="text-gray-400">Loading file inspector...</p>`;
     modal.classList.remove("hidden");
     try {
-        const [fileResponse, mediaResponse, subtitlesResponse] = await Promise.all([
+        const [fileResponse, mediaResponse, subtitlesResponse, operationsResponse] = await Promise.all([
             fetch(`${MASTER_URL}/api/files/${fileId}`),
             fetch(`${MASTER_URL}/api/media/files/${fileId}`),
             fetch(`${MASTER_URL}/api/media/files/${fileId}/subtitles`),
+            fetch(`${MASTER_URL}/api/storage/operations?file_id=${encodeURIComponent(fileId)}`),
         ]);
         const file = await fileResponse.json().catch(() => ({}));
         const media = await mediaResponse.json().catch(() => ({}));
         const subtitles = await subtitlesResponse.json().catch(() => ({ subtitles: [] }));
+        const operations = await operationsResponse.json().catch(() => ({ operations: [] }));
         if (!fileResponse.ok) {
             content.innerHTML = `<p class="text-red-400">${escapeHtml(file.error || "Failed to load file details")}</p>`;
             return;
@@ -673,7 +946,7 @@ async function showDetails(fileId) {
         if (!mediaResponse.ok) {
             media.error = media.error || "Failed to load media details";
         }
-        currentInspector = { file, media, subtitles: subtitles.subtitles || [] };
+        currentInspector = { file, media, subtitles: subtitles.subtitles || [], operations: operations.operations || [] };
         currentInspectorTab = "overview";
         renderFileInspector();
     } catch (error) {
@@ -699,6 +972,7 @@ function renderFileInspector() {
         overview: renderOverviewTab,
         media: renderMediaTab,
         actions: renderActionsTab,
+        storage: renderStorageTab,
         locations: renderLocationsTab,
         subtitles: renderSubtitlesTab,
         debug: renderDebugTab,
@@ -711,6 +985,7 @@ function renderFileInspector() {
                 ${inspectorTabButton("media", "Media")}
                 ${file.media_type === "video" ? inspectorTabButton("subtitles", "Subtitles") : ""}
                 ${inspectorTabButton("actions", "Actions")}
+                ${inspectorTabButton("storage", "Storage")}
                 ${inspectorTabButton("locations", "Locations")}
                 ${inspectorTabButton("debug", "Debug")}
             </div>
@@ -940,6 +1215,66 @@ function renderActionsTab() {
         </section>`;
 }
 
+function storageModeSummary(locations) {
+    const modes = new Set((locations || []).map((loc) => loc.location_type).filter(Boolean));
+    return {
+        hasLocal: modes.has("LOCAL"),
+        hasCached: modes.has("CACHED"),
+        hasPinned: modes.has("PINNED"),
+        hasReplicated: modes.has("REPLICATED"),
+    };
+}
+
+function renderStorageTab() {
+    const file = currentInspector.file;
+    const locations = file.locations || [];
+    const operations = currentInspector.operations || [];
+    const summary = storageModeSummary(locations);
+    const canPromote = summary.hasLocal && !summary.hasCached && (file.file_status || "ACTIVE") === "ACTIVE";
+    const operationRows = operations.length ? operations.map((operation) => `
+        <tr class="border-b border-gray-800 text-xs">
+            <td class="py-2 font-mono text-gray-300">${escapeHtml(operation.operation_id)}</td>
+            <td class="py-2 text-gray-400">${escapeHtml(operation.operation_type)}</td>
+            <td class="py-2 text-gray-200">${escapeHtml(operation.status)}</td>
+            <td class="py-2 text-gray-400">${escapeHtml(operation.progress_percent ?? 0)}%</td>
+            <td class="py-2 text-red-300">${escapeHtml(operation.error_message || "")}</td>
+        </tr>
+    `).join("") : `<tr><td colspan="5" class="py-3 text-gray-500">No storage operations yet.</td></tr>`;
+
+    return `
+        <section class="space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                ${locations.map((loc) => `
+                    <div class="bg-gray-900 border border-gray-800 rounded p-3 text-sm">
+                        <div class="text-cyan-300 font-semibold">${escapeHtml(loc.location_type || "UNKNOWN")}</div>
+                        <div class="text-xs text-gray-400">${escapeHtml(loc.node_id || "")} ${escapeHtml(loc.host || "")}:${escapeHtml(loc.port || "")}</div>
+                        <div class="text-xs text-gray-500 break-all mt-1">${escapeHtml(loc.path || "")}</div>
+                    </div>
+                `).join("") || '<div class="text-gray-500">No storage locations.</div>'}
+            </div>
+            <div class="flex flex-wrap gap-2">
+                ${canPromote ? `<button onclick="promoteToCacheFromInspector()" class="bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold">Promote to Node Storage</button>` : ""}
+                ${summary.hasCached ? `<button disabled class="bg-gray-900 text-gray-600 border border-gray-800 px-3 py-1 rounded text-xs font-semibold">Demote to LOCAL - planned/disabled</button>` : ""}
+                <button disabled class="bg-gray-900 text-gray-600 border border-gray-800 px-3 py-1 rounded text-xs font-semibold">Move to Server Storage - planned/disabled</button>
+            </div>
+            <div id="storage-operation-status" class="text-xs text-gray-500"></div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead class="text-xs text-gray-500">
+                        <tr>
+                            <th class="py-2">Operation</th>
+                            <th class="py-2">Type</th>
+                            <th class="py-2">Status</th>
+                            <th class="py-2">Progress</th>
+                            <th class="py-2">Error</th>
+                        </tr>
+                    </thead>
+                    <tbody>${operationRows}</tbody>
+                </table>
+            </div>
+        </section>`;
+}
+
 function renderLocationsTab() {
     const locations = currentInspector.file.locations || [];
     if (!locations.length) return `<p class="text-gray-500">No locations available.</p>`;
@@ -1029,6 +1364,59 @@ function setSubtitleStatus(message, isError = false) {
     if (!el) return;
     el.innerText = message;
     el.className = isError ? "text-xs text-red-400" : "text-xs text-green-400";
+}
+
+function setStorageOperationStatus(message, isError = false) {
+    const el = document.getElementById("storage-operation-status");
+    if (!el) return;
+    el.innerText = message;
+    el.className = isError ? "text-xs text-red-400" : "text-xs text-green-400";
+}
+
+async function pollStorageOperation(operationId) {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        const response = await fetchJsonOrThrow(`${MASTER_URL}/api/storage/operations/${operationId}`);
+        setStorageOperationStatus(`Operation ${response.status} (${response.progress_percent || 0}%)`);
+        if (["COMPLETED", "FAILED", "CANCELLED"].includes(response.status)) {
+            await refreshInspectorData();
+            currentInspectorTab = "storage";
+            renderFileInspector();
+            setStorageOperationStatus(
+                response.status === "COMPLETED" ? "Operation completed. Details refreshed." : `Operation ${response.status}: ${response.error_message || ""}`,
+                response.status !== "COMPLETED",
+            );
+            await refreshDashboard();
+            return response;
+        }
+    }
+    setStorageOperationStatus("Operation is still running. Refresh details later.", true);
+    return null;
+}
+
+async function promoteToCacheFromInspector() {
+    if (!currentInspector?.file?.file_id) return;
+    try {
+        setStorageOperationStatus("Queueing operation...");
+        const response = await fetch(`${MASTER_URL}/api/files/${currentInspector.file.file_id}/storage/promote-to-cache`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-FSYS-Token": ADMIN_TOKEN },
+            body: JSON.stringify({ requested_by: "dashboard-dev" }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setStorageOperationStatus(data.message || data.error || "Could not queue operation.", true);
+            return;
+        }
+        const operationId = data.operation?.operation_id;
+        setStorageOperationStatus(`Operation queued. status=${data.operation?.status || "PENDING"}`);
+        await refreshInspectorData();
+        currentInspectorTab = "storage";
+        renderFileInspector();
+        if (operationId) await pollStorageOperation(operationId);
+    } catch (error) {
+        setStorageOperationStatus(`Promote failed: ${error.message || error}`, true);
+    }
 }
 
 async function saveMediaChanges() {
@@ -1197,12 +1585,13 @@ async function rejectDraftFromInspector() {
 
 async function refreshInspectorData() {
     if (!currentInspector?.file?.file_id) return;
-    const [file, media, subtitles] = await Promise.all([
+    const [file, media, subtitles, operations] = await Promise.all([
         fetchJsonOrThrow(`${MASTER_URL}/api/files/${currentInspector.file.file_id}`),
         fetchJsonOrThrow(`${MASTER_URL}/api/media/files/${currentInspector.file.file_id}`),
         fetchJsonOrThrow(`${MASTER_URL}/api/media/files/${currentInspector.file.file_id}/subtitles`),
+        fetchJsonOrThrow(`${MASTER_URL}/api/storage/operations?file_id=${encodeURIComponent(currentInspector.file.file_id)}`),
     ]);
-    currentInspector = { file, media, subtitles: subtitles.subtitles || [] };
+    currentInspector = { file, media, subtitles: subtitles.subtitles || [], operations: operations.operations || [] };
     renderFileInspector();
 }
 
@@ -1228,6 +1617,17 @@ function closeDetailsModal() { document.getElementById("details-modal").classLis
 document.getElementById("details-close-btn").addEventListener("click", closeDetailsModal);
 document.getElementById("details-modal").addEventListener("click", (event) => { if (event.target.id === "details-modal") closeDetailsModal(); });
 bindVideoModalEvents();
+document.getElementById("local-register-form")?.addEventListener("submit", handleLocalRegisterSubmit);
+document.getElementById("local-mode-manual")?.addEventListener("click", () => setLocalMode("manual"));
+document.getElementById("local-mode-browse")?.addEventListener("click", () => setLocalMode("browse"));
+document.getElementById("local-library-select")?.addEventListener("change", (event) => {
+    localBrowseState.libraryId = event.target.value;
+    localBrowseState.relativePath = "";
+    localBrowseState.selected.clear();
+    browseLocalLibrary("");
+});
+document.getElementById("local-browse-back")?.addEventListener("click", () => browseLocalLibrary(localBrowseState.parentPath || ""));
+document.getElementById("local-add-selected")?.addEventListener("click", addSelectedLocalFiles);
 
 function setUploadState(message, busy = false) {
     const status = document.getElementById("upload-status");

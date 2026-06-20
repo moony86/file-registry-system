@@ -3,10 +3,33 @@ import re
 import uuid
 import socket
 import json
+import shutil
+import sys
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 
+IS_FROZEN = getattr(sys, "frozen", False)
+RUNTIME_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path.cwd().resolve()
+
+if IS_FROZEN:
+    os.chdir(RUNTIME_DIR)
+
+
+def ensure_portable_env_file():
+    if not IS_FROZEN:
+        return
+
+    env_path = RUNTIME_DIR / ".env"
+    example_path = RUNTIME_DIR / ".env.example"
+    if env_path.exists() or not example_path.exists():
+        return
+
+    shutil.copyfile(example_path, env_path)
+    print("Created .env from .env.example. Please edit MASTER_URLS and LOCAL_LIBRARY_DIRS if needed.")
+
+
+ensure_portable_env_file()
 load_dotenv()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
@@ -95,11 +118,22 @@ else:
 
 
 NODE_PORT = int(os.getenv("NODE_PORT", "5001"))
-MASTER_URLS = os.getenv("MASTER_URL").split(",") if os.getenv("MASTER_URL") else [
-    "http://192.168.1.111:5123",
-    "http://100.93.140.49:5123",
-    "http://localhost:5000"
-]
+
+
+def parse_master_urls():
+    raw_urls = os.getenv("MASTER_URLS") or os.getenv("MASTER_URL") or ""
+    if raw_urls.strip():
+        return [url.strip().rstrip("/") for url in raw_urls.split(",") if url.strip()]
+    return [
+        "http://192.168.1.111:5123",
+        "http://100.93.140.49:5123",
+        "http://localhost:5000",
+    ]
+
+
+MASTER_URLS = parse_master_urls()
+if not MASTER_URLS:
+    raise RuntimeError("At least one MASTER_URL or MASTER_URLS entry is required")
 
 MASTER_URL = MASTER_URLS[0]
 

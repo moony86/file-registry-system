@@ -333,6 +333,26 @@ class Database:
                 )
             """)
 
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS storage_operations (
+                    operation_id UUID PRIMARY KEY,
+                    file_id UUID NOT NULL REFERENCES file_aliases(file_id) ON DELETE CASCADE,
+                    content_hash VARCHAR(64) NOT NULL,
+                    operation_type VARCHAR(50) NOT NULL,
+                    source_location_id INTEGER REFERENCES content_locations(location_id) ON DELETE SET NULL,
+                    target_node_id VARCHAR(200) REFERENCES storage_nodes(node_id) ON DELETE SET NULL,
+                    status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+                    progress_percent INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    result_json TEXT,
+                    requested_by VARCHAR(200),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_id INTEGER REFERENCES media_collections(collection_id)")
             conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_title VARCHAR(500)")
             conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_type VARCHAR(50) DEFAULT 'unknown'")
@@ -358,6 +378,8 @@ class Database:
             conn.run("CREATE INDEX IF NOT EXISTS idx_media_technical_metadata_status ON media_technical_metadata(probe_status)")
             conn.run("CREATE INDEX IF NOT EXISTS idx_media_thumbnails_status ON media_thumbnails(thumbnail_status)")
             conn.run("CREATE INDEX IF NOT EXISTS idx_subtitle_tracks_file_status ON subtitle_tracks(file_id, status)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_storage_operations_file_status ON storage_operations(file_id, operation_type, status)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_storage_operations_pending ON storage_operations(status, created_at)")
 
     # ========== Node Management ==========
     def register_node(self, node_id, host, port, shared_space_enabled=False,
@@ -562,6 +584,237 @@ class Database:
             self._upsert_content_location_in_tx(
                 conn, content_hash, node_id, physical_path, location_type, is_primary
             )
+
+    def _storage_operation_row_to_dict(self, row):
+        if not row:
+            return None
+        columns = [
+            'operation_id', 'file_id', 'content_hash', 'operation_type',
+            'source_location_id', 'target_node_id', 'status', 'progress_percent',
+            'error_message', 'result_json', 'requested_by', 'created_at',
+            'started_at', 'completed_at', 'updated_at',
+        ]
+        result = dict(zip(columns, row))
+        result["operation_id"] = str(result["operation_id"])
+        result["file_id"] = str(result["file_id"])
+        return result
+
+    def _storage_operation_rows_to_dicts(self, rows):
+        return [self._storage_operation_row_to_dict(row) for row in rows]
+
+    def create_promote_to_cache_operation(self, file_id, requested_by="dashboard-dev"):
+        operation_type = "promote_local_to_cached"
+        with self._transaction() as conn:
+            file_rows = conn.run("""
+                SELECT fa.file_id, fa.content_hash
+                FROM file_aliases fa
+                WHERE fa.file_id = :file_id
+                  AND COALESCE(fa.file_status, 'ACTIVE') = 'ACTIVE'
+                LIMIT 1
+            """, file_id=file_id) or []
+            if not file_rows:
+                return {"created": False, "status": "not_found", "message": "File not found or not active"}
+
+            _, content_hash = file_rows[0]
+
+            cached_rows = conn.run("""
+                SELECT location_id
+                FROM content_locations
+                WHERE content_hash = :content_hash
+                  AND location_type = 'CACHED'
+                LIMIT 1
+            """, content_hash=content_hash) or []
+            if cached_rows:
+                return {"created": False, "status": "already_cached", "message": "File already has a CACHED location"}
+
+            active_rows = conn.run("""
+                SELECT operation_id, status
+                FROM storage_operations
+                WHERE file_id = :file_id
+                  AND operation_type = :operation_type
+                  AND status IN ('PENDING', 'RUNNING')
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, file_id=file_id, operation_type=operation_type) or []
+            if active_rows:
+                return {
+                    "created": False,
+                    "status": "already_queued",
+                    "operation_id": str(active_rows[0][0]),
+                    "operation_status": active_rows[0][1],
+                    "message": "A promote operation is already pending or running for this file",
+                }
+
+            local_rows = conn.run("""
+                SELECT
+                    cl.location_id, cl.node_id, sn.host, sn.port, sn.status
+                FROM content_locations cl
+                JOIN storage_nodes sn ON cl.node_id = sn.node_id
+                WHERE cl.content_hash = :content_hash
+                  AND cl.location_type = 'LOCAL'
+                  AND sn.status = 'ONLINE'
+                  AND sn.last_heartbeat > NOW() - (:timeout_seconds * INTERVAL '1 second')
+                ORDER BY cl.last_seen DESC
+                LIMIT 1
+            """, content_hash=content_hash, timeout_seconds=NODE_TIMEOUT_SECONDS) or []
+            if not local_rows:
+                return {"created": False, "status": "no_local_online", "message": "No online LOCAL location found"}
+
+            source_location_id, target_node_id, _, _, _ = local_rows[0]
+            operation_id = uuid.uuid4()
+            rows = conn.run("""
+                INSERT INTO storage_operations (
+                    operation_id, file_id, content_hash, operation_type,
+                    source_location_id, target_node_id, status, progress_percent,
+                    requested_by, updated_at
+                )
+                VALUES (
+                    :operation_id, :file_id, :content_hash, :operation_type,
+                    :source_location_id, :target_node_id, 'PENDING', 0,
+                    :requested_by, CURRENT_TIMESTAMP
+                )
+                RETURNING
+                    operation_id, file_id, content_hash, operation_type,
+                    source_location_id, target_node_id, status, progress_percent,
+                    error_message, result_json, requested_by, created_at,
+                    started_at, completed_at, updated_at
+            """, operation_id=operation_id, file_id=file_id, content_hash=content_hash,
+                 operation_type=operation_type, source_location_id=source_location_id,
+                 target_node_id=target_node_id, requested_by=requested_by) or []
+
+        operation = self._storage_operation_row_to_dict(rows[0]) if rows else None
+        return {"created": True, "status": "queued", "operation": operation}
+
+    def get_storage_operation(self, operation_id):
+        rows = self._fetch_all("""
+            SELECT
+                operation_id, file_id, content_hash, operation_type,
+                source_location_id, target_node_id, status, progress_percent,
+                error_message, result_json, requested_by, created_at,
+                started_at, completed_at, updated_at
+            FROM storage_operations
+            WHERE operation_id = :operation_id
+            LIMIT 1
+        """, operation_id=operation_id)
+        return self._storage_operation_row_to_dict(rows[0]) if rows else None
+
+    def list_storage_operations(self, file_id=None, limit=50):
+        if file_id:
+            rows = self._fetch_all("""
+                SELECT
+                    operation_id, file_id, content_hash, operation_type,
+                    source_location_id, target_node_id, status, progress_percent,
+                    error_message, result_json, requested_by, created_at,
+                    started_at, completed_at, updated_at
+                FROM storage_operations
+                WHERE file_id = :file_id
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """, file_id=file_id, limit=limit)
+        else:
+            rows = self._fetch_all("""
+                SELECT
+                    operation_id, file_id, content_hash, operation_type,
+                    source_location_id, target_node_id, status, progress_percent,
+                    error_message, result_json, requested_by, created_at,
+                    started_at, completed_at, updated_at
+                FROM storage_operations
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """, limit=limit)
+        return self._storage_operation_rows_to_dicts(rows)
+
+    def file_has_cached_location(self, file_id):
+        rows = self._fetch_all("""
+            SELECT cl.location_id
+            FROM file_aliases fa
+            JOIN content_locations cl ON fa.content_hash = cl.content_hash
+            WHERE fa.file_id = :file_id
+              AND cl.location_type = 'CACHED'
+            LIMIT 1
+        """, file_id=file_id)
+        return bool(rows)
+
+    def claim_pending_storage_operation(self):
+        with self._transaction() as conn:
+            rows = conn.run("""
+                SELECT
+                    so.operation_id, so.file_id, so.content_hash, so.operation_type,
+                    so.source_location_id, so.target_node_id, so.status, so.progress_percent,
+                    so.error_message, so.result_json, so.requested_by, so.created_at,
+                    so.started_at, so.completed_at, so.updated_at,
+                    fa.file_name, cl.physical_path, sn.host, sn.port
+                FROM storage_operations so
+                JOIN file_aliases fa ON so.file_id = fa.file_id
+                JOIN content_locations cl ON so.source_location_id = cl.location_id
+                JOIN storage_nodes sn ON so.target_node_id = sn.node_id
+                WHERE so.status = 'PENDING'
+                ORDER BY so.created_at ASC
+                LIMIT 1
+                FOR UPDATE
+            """) or []
+            if not rows:
+                return None
+
+            operation_id = rows[0][0]
+            conn.run("""
+                UPDATE storage_operations
+                SET status = 'RUNNING',
+                    started_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP,
+                    progress_percent = 0
+                WHERE operation_id = :operation_id
+            """, operation_id=operation_id)
+
+        columns = [
+            'operation_id', 'file_id', 'content_hash', 'operation_type',
+            'source_location_id', 'target_node_id', 'status', 'progress_percent',
+            'error_message', 'result_json', 'requested_by', 'created_at',
+            'started_at', 'completed_at', 'updated_at',
+            'file_name', 'physical_path', 'host', 'port',
+        ]
+        operation = dict(zip(columns, rows[0]))
+        operation["operation_id"] = str(operation["operation_id"])
+        operation["file_id"] = str(operation["file_id"])
+        operation["status"] = "RUNNING"
+        return operation
+
+    def complete_storage_operation(self, operation_id, result_json=None):
+        with self._transaction() as conn:
+            rows = conn.run("""
+                UPDATE storage_operations
+                SET status = 'COMPLETED',
+                    progress_percent = 100,
+                    result_json = :result_json,
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP,
+                    error_message = NULL
+                WHERE operation_id = :operation_id
+                RETURNING
+                    operation_id, file_id, content_hash, operation_type,
+                    source_location_id, target_node_id, status, progress_percent,
+                    error_message, result_json, requested_by, created_at,
+                    started_at, completed_at, updated_at
+            """, operation_id=operation_id, result_json=result_json) or []
+        return self._storage_operation_row_to_dict(rows[0]) if rows else None
+
+    def fail_storage_operation(self, operation_id, error_message, result_json=None):
+        with self._transaction() as conn:
+            rows = conn.run("""
+                UPDATE storage_operations
+                SET status = 'FAILED',
+                    error_message = :error_message,
+                    result_json = :result_json,
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE operation_id = :operation_id
+                RETURNING
+                    operation_id, file_id, content_hash, operation_type,
+                    source_location_id, target_node_id, status, progress_percent,
+                    error_message, result_json, requested_by, created_at,
+                    started_at, completed_at, updated_at
+            """, operation_id=operation_id, error_message=error_message, result_json=result_json) or []
+        return self._storage_operation_row_to_dict(rows[0]) if rows else None
 
     def upsert_technical_metadata(self, content_hash, metadata):
         if not content_hash or not metadata:
