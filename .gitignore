@@ -4,3 +4,15 @@ venv/
 __pycache__/
 *.pyc
 shared_space/
+# runtime storage
+shared_space/
+trash/
+
+# generated thumbnails
+storage-node/thumbnails/
+
+# uploaded subtitles
+master-node/subtitles/
+
+# optional
+*.log
