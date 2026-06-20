@@ -1,4 +1,3 @@
-import sys
 from flask import Flask
 from flask_cors import CORS
 
@@ -10,6 +9,7 @@ from routes.status import create_status_blueprint
 from services.heartbeat import start_heartbeat
 from services.master_client import MasterClient
 from services.space_cache import SpaceCache
+from services.registration import start_registration_loop
 
 
 def create_app():
@@ -47,13 +47,13 @@ if __name__ == "__main__":
 
     space_cache.resync_from_disk()
 
-    if master_client.register_node(
+    start_registration_loop(
+        master_client=master_client,
+        space_cache=space_cache,
         shared_space_enabled=config.SHARED_SPACE_ENABLED,
         shared_space_limit_bytes=config.SHARED_SPACE_LIMIT_BYTES,
-        shared_space_used_bytes=space_cache.used(),
-    ):
-        start_heartbeat(master_client, space_cache)
-        app.run(host="0.0.0.0", port=config.NODE_PORT, debug=False)
-    else:
-        print("Failed to register with master. Exiting.")
-        sys.exit(1)
+    )
+
+    start_heartbeat(master_client, space_cache)
+
+    app.run(host="0.0.0.0", port=config.NODE_PORT, debug=False)

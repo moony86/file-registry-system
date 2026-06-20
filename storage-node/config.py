@@ -1,13 +1,108 @@
 import os
+import re
+import uuid
+import socket
+import json
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
-NODE_ID = os.getenv("NODE_ID", "node-unknown")
-NODE_HOST = os.getenv("NODE_HOST", "localhost")
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+IDENTITY_FILE = DATA_DIR / "node_identity.json"
+
+
+def sanitize_hostname(name: str) -> str:
+    name = (name or "unknown-host").strip().lower()
+    name = re.sub(r"[^a-z0-9\-_]", "-", name)
+    name = re.sub(r"-+", "-", name)
+    return name.strip("-") or "unknown-host"
+
+
+def get_local_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception as exc:
+        print(f"[WARNING] Could not detect local IP, using 127.0.0.1: {exc}")
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def read_identity_file() -> dict:
+    if not IDENTITY_FILE.exists():
+        return {}
+
+    try:
+        with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Node identity file is corrupted: {IDENTITY_FILE}. "
+            "Fix it manually or delete it only if you intentionally want a new node identity."
+        ) from exc
+
+
+def write_identity_file(data: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(IDENTITY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+
+def load_or_create_node_identity() -> dict:
+    existing = read_identity_file()
+
+    hostname = sanitize_hostname(socket.gethostname())
+    current_ip = get_local_ip()
+    now = datetime.utcnow().isoformat()
+
+    node_id = existing.get("node_id")
+    if not node_id:
+        node_id = f"node-{hostname}-{uuid.uuid4().hex[:8]}"
+
+    created_at = existing.get("created_at") or now
+
+    identity = {
+        "node_id": node_id,
+        "generated_host": current_ip,
+        "hostname": hostname,
+        "created_at": created_at,
+        "updated_at": now,
+    }
+
+    if identity != existing:
+        write_identity_file(identity)
+
+    return identity
+
+
+node_identity = load_or_create_node_identity()
+
+env_node_id = os.getenv("NODE_ID", "auto").strip()
+if env_node_id.lower() in {"auto", ""}:
+    NODE_ID = node_identity["node_id"]
+else:
+    NODE_ID = env_node_id
+
+env_node_host = os.getenv("NODE_HOST", "auto").strip()
+if env_node_host.lower() in {"auto", ""}:
+    NODE_HOST = node_identity["generated_host"]
+else:
+    NODE_HOST = env_node_host
+
+
 NODE_PORT = int(os.getenv("NODE_PORT", "5001"))
-MASTER_URL = os.getenv("MASTER_URL", "http://localhost:5000")
+MASTER_URLS = os.getenv("MASTER_URL").split(",") if os.getenv("MASTER_URL") else [
+    "http://192.168.1.111:5123",
+    "http://100.93.140.49:5123",
+    "http://localhost:5000"
+]
+
+MASTER_URL = MASTER_URLS[0]
+
 NODE_TOKEN = os.getenv("FSYS_NODE_TOKEN", "dev-token")
 
 SHARED_SPACE_DIR = Path(os.getenv("SHARED_SPACE_DIR", "./shared_space")).resolve()

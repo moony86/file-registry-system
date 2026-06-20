@@ -359,8 +359,8 @@ def create_files_blueprint(db):
                 restore_results.append({
                     "node_id": node_id,
                     "location_type": location_type,
-                    "action": "skipped",
-                    "reason": "LOCAL/original files are not modified by restore"
+                    "action": "local_reactivated",
+                    "reason": "LOCAL/original files require DB reactivation only"
                 })
                 continue
 
@@ -398,7 +398,7 @@ def create_files_blueprint(db):
                 })
 
                 # On success, update registry location and count success
-                if response.status_code == 200 and payload.get("status") in ("restored", "already_restored"):
+                if response.status_code == 200 and payload.get("status") in ("restored", "already_restored", "local_reactivated"):
                     successful_nodes += 1
                     shared_path = payload.get("shared_space_path")
                     if shared_path:

@@ -3,6 +3,7 @@ from pathlib import Path
 import mimetypes
 import shutil
 import time
+import os
 from datetime import datetime
 
 from services.hashing import sha256_file, path_for_hash, safe_existing_file_path
@@ -29,10 +30,9 @@ def create_files_blueprint(config, space_cache, master_client):
             return None
         return config.THUMBNAILS_DIR / content_hash[:2] / f"{content_hash}.jpg"
 
-
     @bp.route("/register", methods=["POST"])
     def register_local_file():
-        data = request.get_json(force=True)
+        data = request.get_json(silent=True) or {}
         try:
             source_path = safe_existing_file_path(data.get("physical_path", ""))
             content_hash = data.get("content_hash") or sha256_file(source_path)
@@ -61,6 +61,112 @@ def create_files_blueprint(config, space_cache, master_client):
             return jsonify({"error": str(exc)}), 404
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
+
+    @bp.route("/register-local", methods=["POST"])
+    def register_pure_local_file():
+        """
+        Register a real local file already present on this node without copying it.
+        This creates a LOCAL location in the master registry.
+        """
+
+        if not require_node_token():
+            return jsonify({"error": "Unauthorized"}), 401
+
+        data = request.get_json(silent=True) or {}
+        raw_path = data.get("physical_path")
+        owner = data.get("owner", "anonymous")
+
+        if not raw_path:
+            return jsonify({"error": "Missing 'physical_path' in request body"}), 400
+
+        try:
+            source_path = Path(raw_path).expanduser().resolve()
+            if not source_path.exists():
+                return jsonify({"error": f"Local file not found: {raw_path}"}), 404
+            if not source_path.is_file():
+                return jsonify({"error": f"Path exists but is not a file: {raw_path}"}), 400
+
+            allowed_dirs_env = os.getenv("LOCAL_LIBRARY_DIRS", "").strip()
+            if allowed_dirs_env:
+                allowed_paths = [
+                    Path(d.strip()).resolve()
+                    for d in allowed_dirs_env.split(",")
+                    if d.strip()
+                ]
+                is_allowed = any(is_path_inside(allowed_dir, source_path) for allowed_dir in allowed_paths)
+                if not is_allowed:
+                    return jsonify({
+                        "error": "Access denied. Path is outside allowed directories.",
+                        "allowed_libraries": allowed_dirs_env,
+                    }), 403
+            else:
+                current_app.logger.warning(
+                    "[SECURITY WARNING] LOCAL_LIBRARY_DIRS is empty. "
+                    "Node is operating in liberal development mode and will accept any valid local file path: %s",
+                    source_path,
+                )
+
+            content_hash = sha256_file(source_path)
+            size_bytes = source_path.stat().st_size
+            file_name = source_path.name
+
+            mime_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+            media_type = detect_media_type(mime_type, file_name)
+
+            technical_metadata = None
+            thumbnail_metadata = None
+
+            if media_type in {"video", "audio"}:
+                technical_metadata = probe_media_file(source_path)
+
+            if media_type == "video":
+                thumbnail_metadata = generate_thumbnail(
+                    source_path,
+                    content_hash,
+                    config.THUMBNAILS_DIR,
+                    duration_seconds=(technical_metadata or {}).get("duration_seconds"),
+                )
+
+            response = master_client.register_file(
+                content_hash=content_hash,
+                file_name=file_name,
+                owner=owner,
+                size_bytes=size_bytes,
+                mime_type=mime_type,
+                media_type=media_type,
+                physical_path=str(source_path),
+                location_type="LOCAL",
+                technical_metadata=technical_metadata,
+                thumbnail_metadata=thumbnail_metadata,
+            )
+
+            if response.status_code >= 400:
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = {"error": response.text or "Master registry rejected local registration"}
+                return jsonify(payload), response.status_code
+
+            try:
+                result = response.json()
+            except Exception:
+                return jsonify({
+                    "error": "Master registry returned a non-JSON response",
+                    "master_status_code": response.status_code,
+                }), 502
+
+            result["content_hash"] = content_hash
+            result["size_bytes"] = size_bytes
+            result["media_type"] = media_type
+            result["mime_type"] = mime_type
+            result["location_type"] = "LOCAL"
+            result["physical_path"] = str(source_path)
+
+            return jsonify(result), response.status_code
+
+        except Exception:
+            current_app.logger.exception("Failed to register pure local file: %s", raw_path)
+            return jsonify({"error": "Failed to register local file"}), 500
 
     @bp.route("/cache", methods=["POST"])
     def cache_upload():
@@ -139,6 +245,7 @@ def create_files_blueprint(config, space_cache, master_client):
             media_type = detect_media_type(mime_type, original_name)
             technical_metadata = None
             thumbnail_metadata = None
+
             if media_type in {"video", "audio"}:
                 technical_metadata = probe_media_file(final_path)
                 if technical_metadata.get("probe_status") != "success":
@@ -148,6 +255,7 @@ def create_files_blueprint(config, space_cache, master_client):
                         technical_metadata.get("probe_status"),
                         technical_metadata.get("probe_error"),
                     )
+
             if media_type == "video":
                 thumbnail_metadata = generate_thumbnail(
                     final_path,
@@ -275,7 +383,6 @@ def create_files_blueprint(config, space_cache, master_client):
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
-
     @bp.route("/<file_id>/stream", methods=["GET"])
     def stream_file(file_id):
         try:
@@ -367,27 +474,20 @@ def create_files_blueprint(config, space_cache, master_client):
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
-
     @bp.route("/<file_id>/trash", methods=["POST"])
     def trash_managed_file(file_id):
-        """
-        Move a managed Shared Space copy to node-local trash.
-
-        This endpoint must never touch arbitrary LOCAL user files. It only accepts
-        paths inside SHARED_SPACE_DIR and only for managed location types.
-        """
         if not require_node_token():
             return jsonify({"error": "Unauthorized"}), 401
 
-        data = request.get_json(force=True) or {}
+        data = request.get_json(silent=True) or {}
         content_hash = data.get("content_hash")
         raw_path = data.get("physical_path")
         location_type = data.get("location_type", "LOCAL")
 
-        if location_type not in {"CACHED", "PINNED", "REPLICATED"}:
+        if location_type == "LOCAL":
             return jsonify({
                 "status": "skipped",
-                "reason": "Only managed Shared Space copies can be moved to trash",
+                "reason": "Only managed Shared Space copies can be moved to trash. LOCAL files are protected.",
                 "location_type": location_type,
             }), 200
 
@@ -432,7 +532,6 @@ def create_files_blueprint(config, space_cache, master_client):
             shutil.move(str(source_path), str(trash_path))
             space_cache.subtract(size_bytes)
 
-            # Best-effort cleanup of now-empty hash shard directory.
             try:
                 source_path.parent.rmdir()
             except OSError:
@@ -449,21 +548,20 @@ def create_files_blueprint(config, space_cache, master_client):
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
-
     @bp.route("/<file_id>/restore-from-trash", methods=["POST"])
     def restore_from_trash(file_id):
         if not require_node_token():
             return jsonify({"error": "Unauthorized"}), 401
 
-        data = request.get_json(force=True) or {}
+        data = request.get_json(silent=True) or {}
         content_hash = data.get("content_hash")
         raw_trash_path = data.get("trash_path")
         location_type = data.get("location_type", "LOCAL")
 
-        if location_type not in {"CACHED", "PINNED", "REPLICATED"}:
+        if location_type == "LOCAL":
             return jsonify({
-                "status": "skipped",
-                "reason": "Only managed Shared Space copies can be restored",
+                "status": "local_reactivated",
+                "reason": "LOCAL file remains in place; no trash restore required.",
                 "location_type": location_type,
             }), 200
 
@@ -477,7 +575,6 @@ def create_files_blueprint(config, space_cache, master_client):
             trash_path = Path(raw_trash_path).expanduser().resolve()
 
             def original_name_from_trash_path(path):
-                # Trash names are {file_id}-{source_name} or {file_id}-{counter}-{source_name}.
                 match = re.match(r'^' + re.escape(str(file_id)) + r'(?:-\d+)?-(.+)$', path.name)
                 return match.group(1) if match else path.name
 
@@ -542,7 +639,6 @@ def create_files_blueprint(config, space_cache, master_client):
                         )
                     return jsonify({"status": "already_missing", "path": str(trash_path)}), 200
 
-            # Safety: ensure this is inside the node's trash directory
             try:
                 trash_path.resolve().relative_to(trash_root.resolve())
             except Exception:
@@ -561,8 +657,6 @@ def create_files_blueprint(config, space_cache, master_client):
                 else:
                     return jsonify({"error": "Refusing to restore file outside TRASH_DIR", "path": str(trash_path)}), 403
 
-            # Derive original filename from trash entry. Trash names were created as:
-            #   {file_id}-{source_name}  or {file_id}-{counter}-{source_name}
             original_name = original_name_from_trash_path(trash_path)
 
             final_path = path_for_hash(config.SHARED_SPACE_DIR, content_hash, original_name)
@@ -571,7 +665,6 @@ def create_files_blueprint(config, space_cache, master_client):
             size_bytes = trash_path.stat().st_size
 
             if final_path.exists():
-                # Verify existing shared-space file matches expected content hash before deleting trash copy
                 response, status_code = already_restored_response(final_path)
                 if status_code != 200:
                     return response, status_code
@@ -580,10 +673,8 @@ def create_files_blueprint(config, space_cache, master_client):
 
             shutil.move(str(trash_path), str(final_path))
 
-            # Verify checksum after restore to avoid swapping in incorrect file
             actual_hash = sha256_file(final_path)
             if actual_hash != content_hash:
-                # Move it back to trash and report error
                 try:
                     shutil.move(str(final_path), str(trash_path))
                 except Exception:
@@ -595,12 +686,10 @@ def create_files_blueprint(config, space_cache, master_client):
                 }), 409
 
             try:
-                # Increase recorded used bytes
                 space_cache.add(size_bytes)
             except Exception:
                 pass
 
-            # Best-effort cleanup of empty trash directory
             try:
                 trash_path.parent.rmdir()
             except OSError:
