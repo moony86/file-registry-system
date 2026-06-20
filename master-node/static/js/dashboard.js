@@ -26,6 +26,25 @@ function formatBytes(bytes) {
     return `${value.toFixed(i === 0 ? 0 : 1)} ${sizes[i]}`;
 }
 
+function formatDuration(seconds) {
+    seconds = Number(seconds || 0);
+    if (!seconds) return "";
+    const total = Math.round(seconds);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const remainingSeconds = total % 60;
+    if (hours) return `${hours}h ${minutes}m ${remainingSeconds}s`;
+    return `${minutes}m ${remainingSeconds}s`;
+}
+
+function formatBitrate(bitsPerSecond) {
+    bitsPerSecond = Number(bitsPerSecond || 0);
+    if (!bitsPerSecond) return "";
+    if (bitsPerSecond >= 1000000) return `${(bitsPerSecond / 1000000).toFixed(1)} Mbps`;
+    if (bitsPerSecond >= 1000) return `${(bitsPerSecond / 1000).toFixed(1)} Kbps`;
+    return `${bitsPerSecond} bps`;
+}
+
 async function fetchJsonOrThrow(url) {
     const response = await fetch(url);
     const contentType = response.headers.get("content-type") || "";
@@ -377,11 +396,41 @@ async function playVideo(fileId) {
         const player = document.getElementById("video-player");
         const title = document.getElementById("video-title");
         title.innerText = data.file_name || "Video";
+        await loadSubtitleTracks(player, fileId);
         player.src = `http://${host}:${port}/api/files/${fileId}/stream`;
         modal.classList.remove("hidden");
         player.play().catch(() => {});
     } catch (error) {
         alert(`Cannot play video: ${error}`);
+    }
+}
+
+async function loadSubtitleTracks(player, fileId) {
+    if (!player) return;
+    player.querySelectorAll("track").forEach((track) => track.remove());
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/files/${fileId}/subtitles`);
+        if (!response.ok) return;
+        const data = await response.json().catch(() => ({}));
+        const playable = (data.subtitles || []).filter((subtitle) =>
+            subtitle.status === "active"
+            && subtitle.subtitle_format !== "ass"
+            && (subtitle.vtt_path || subtitle.subtitle_format === "vtt")
+        );
+        const hasDefault = playable.some((subtitle) => subtitle.is_default);
+        playable.forEach((subtitle, index) => {
+            const track = document.createElement("track");
+            track.kind = "subtitles";
+            track.src = `${MASTER_URL}/api/media/subtitles/${subtitle.subtitle_id}/file`;
+            track.srclang = subtitle.language || "unknown";
+            track.label = subtitle.label || subtitle.language || "Subtitle";
+            if (subtitle.is_default || (!hasDefault && index === 0)) {
+                track.default = true;
+            }
+            player.appendChild(track);
+        });
+    } catch (error) {
+        console.warn("Failed to load subtitles:", error);
     }
 }
 
@@ -420,6 +469,7 @@ function closeVideoModal() {
     const player = document.getElementById("video-player");
     if (!modal || !player) return;
     player.pause();
+    player.querySelectorAll("track").forEach((track) => track.remove());
     player.removeAttribute("src");
     player.load();
     modal.classList.add("hidden");
@@ -608,12 +658,14 @@ async function showDetails(fileId) {
     content.innerHTML = `<p class="text-gray-400">Loading file inspector...</p>`;
     modal.classList.remove("hidden");
     try {
-        const [fileResponse, mediaResponse] = await Promise.all([
+        const [fileResponse, mediaResponse, subtitlesResponse] = await Promise.all([
             fetch(`${MASTER_URL}/api/files/${fileId}`),
             fetch(`${MASTER_URL}/api/media/files/${fileId}`),
+            fetch(`${MASTER_URL}/api/media/files/${fileId}/subtitles`),
         ]);
         const file = await fileResponse.json().catch(() => ({}));
         const media = await mediaResponse.json().catch(() => ({}));
+        const subtitles = await subtitlesResponse.json().catch(() => ({ subtitles: [] }));
         if (!fileResponse.ok) {
             content.innerHTML = `<p class="text-red-400">${escapeHtml(file.error || "Failed to load file details")}</p>`;
             return;
@@ -621,7 +673,7 @@ async function showDetails(fileId) {
         if (!mediaResponse.ok) {
             media.error = media.error || "Failed to load media details";
         }
-        currentInspector = { file, media };
+        currentInspector = { file, media, subtitles: subtitles.subtitles || [] };
         currentInspectorTab = "overview";
         renderFileInspector();
     } catch (error) {
@@ -648,6 +700,7 @@ function renderFileInspector() {
         media: renderMediaTab,
         actions: renderActionsTab,
         locations: renderLocationsTab,
+        subtitles: renderSubtitlesTab,
         debug: renderDebugTab,
     }[currentInspectorTab]();
 
@@ -656,6 +709,7 @@ function renderFileInspector() {
             <div class="flex flex-wrap gap-2 border-b border-gray-800 pb-3">
                 ${inspectorTabButton("overview", "Overview")}
                 ${inspectorTabButton("media", "Media")}
+                ${file.media_type === "video" ? inspectorTabButton("subtitles", "Subtitles") : ""}
                 ${inspectorTabButton("actions", "Actions")}
                 ${inspectorTabButton("locations", "Locations")}
                 ${inspectorTabButton("debug", "Debug")}
@@ -674,6 +728,30 @@ function renderFileInspector() {
 function renderOverviewTab() {
     const file = currentInspector.file;
     const hash = file.content_hash || "";
+    const technical = file.technical_metadata;
+    const thumbnail = file.thumbnail;
+    const thumbnailPreview = file.media_type === "video" ? `
+            <div class="pt-3 border-t border-gray-800">
+                <div class="text-sm font-semibold text-gray-200 mb-2">Thumbnail Preview</div>
+                <div class="max-w-sm bg-gray-950 border border-gray-800 overflow-hidden">
+                    <img src="${MASTER_URL}/api/files/${encodeURIComponent(file.file_id)}/thumbnail" alt="" class="w-full aspect-video object-cover">
+                </div>
+                <div class="mt-2 text-xs text-gray-500">Status: ${escapeHtml(thumbnail?.thumbnail_status || "placeholder")}</div>
+                <button disabled class="mt-2 bg-gray-900 text-gray-600 border border-gray-800 px-3 py-1 rounded text-xs font-semibold">Regenerate Thumbnail planned</button>
+            </div>
+        ` : "";
+    const technicalRows = technical ? `
+            <div class="pt-3 border-t border-gray-800 text-sm font-semibold text-gray-200">Technical Metadata</div>
+            ${detailRow("Probe status", technical.probe_status || "unknown")}
+            ${detailRow("Duration", formatDuration(technical.duration_seconds) || "")}
+            ${detailRow("Resolution", technical.width && technical.height ? `${technical.width}x${technical.height}` : "")}
+            ${detailRow("Video", technical.video_codec || "")}
+            ${detailRow("Audio", [technical.audio_codec, technical.audio_channels ? `${technical.audio_channels} ch` : ""].filter(Boolean).join(" "))}
+            ${detailRow("FPS", technical.fps ? Number(technical.fps).toFixed(3) : "")}
+            ${detailRow("Bitrate", formatBitrate(technical.bitrate))}
+            ${detailRow("Format", technical.format_name || "")}
+            ${technical.probe_error ? detailRow("Probe error", technical.probe_error) : ""}
+        ` : "";
     return `
         <section class="space-y-3">
             ${detailRow("File name", file.file_name)}
@@ -686,6 +764,8 @@ function renderOverviewTab() {
             ${detailRow("Created at", file.created_at || "")}
             ${detailRow("Content hash", hash)}
             ${detailRow("Popularity", file.popularity_score || 0)}
+            ${thumbnailPreview}
+            ${technicalRows}
         </section>`;
 }
 
@@ -747,6 +827,9 @@ function renderMediaTab() {
             ? `${values.collectionTitle} (${values.collectionType || "unknown"})`
             : "None";
     const showNewCollection = values.collectionId === "__new__";
+    const canReviewDraft = values.mode === "draft" && values.reviewStatus === "pending";
+    const saveLabel = canReviewDraft ? "Save Draft" : "Save Changes";
+    const canDeleteCollection = values.collectionId && values.collectionId !== "__new__";
     return `
         <section class="space-y-4">
             <div class="text-xs text-gray-400">Mode: <span class="text-cyan-300">${escapeHtml(values.mode)}</span> | Review status: ${escapeHtml(values.reviewStatus)}</div>
@@ -766,8 +849,75 @@ function renderMediaTab() {
             </div>
             <div id="inspector-media-status" class="text-xs text-gray-500"></div>
             <div class="flex flex-wrap gap-2">
-                <button onclick="saveMediaChanges()" class="bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold">Save Changes</button>
-                ${values.mode === "draft" ? `<button onclick="approveDraftFromInspector()" class="bg-green-700 text-white px-3 py-1 rounded text-xs font-semibold">Approve</button><button onclick="rejectDraftFromInspector()" class="bg-red-900/40 text-red-200 border border-red-700/50 px-3 py-1 rounded text-xs font-semibold">Reject</button>` : ""}
+                <button onclick="saveMediaChanges()" class="bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold">${saveLabel}</button>
+                ${canReviewDraft ? `<button onclick="approveDraftFromInspector()" class="bg-green-700 text-white px-3 py-1 rounded text-xs font-semibold">Approve</button><button onclick="rejectDraftFromInspector()" class="bg-red-900/40 text-red-200 border border-red-700/50 px-3 py-1 rounded text-xs font-semibold">Reject</button>` : ""}
+                ${canDeleteCollection ? `<button onclick="deleteSelectedCollection()" class="bg-gray-800 text-red-200 border border-red-800 px-3 py-1 rounded text-xs font-semibold">Delete Collection</button>` : ""}
+            </div>
+        </section>`;
+}
+
+function renderSubtitlesTab() {
+    const file = currentInspector.file;
+    if (file.media_type !== "video") {
+        return `<p class="text-gray-500 border border-gray-800 rounded p-4">Subtitles are available for video files only.</p>`;
+    }
+
+    const subtitles = currentInspector.subtitles || [];
+    const rows = subtitles.length ? subtitles.map((subtitle) => {
+        const playable = subtitle.subtitle_format !== "ass" && (subtitle.vtt_path || subtitle.subtitle_format === "vtt");
+        return `
+            <tr class="border-b border-gray-800 text-sm">
+                <td class="py-2 text-gray-200">${escapeHtml(subtitle.label || "Subtitle")}</td>
+                <td class="py-2 text-gray-400">${escapeHtml(subtitle.language || "unknown")}</td>
+                <td class="py-2 text-gray-400">${escapeHtml(subtitle.subtitle_format || "unknown")}</td>
+                <td class="py-2 text-gray-400">${subtitle.is_default ? "yes" : ""}</td>
+                <td class="py-2 text-gray-400">${playable ? "player" : "stored only"}</td>
+                <td class="py-2">
+                    <div class="flex flex-wrap gap-2">
+                        ${subtitle.is_default ? "" : `<button onclick="setDefaultSubtitle(${subtitle.subtitle_id})" class="bg-cyan-900/40 text-cyan-200 border border-cyan-800 px-2 py-1 rounded text-xs">Set Default</button>`}
+                        <button onclick="deleteSubtitle(${subtitle.subtitle_id})" class="bg-red-900/40 text-red-200 border border-red-800 px-2 py-1 rounded text-xs">Delete</button>
+                    </div>
+                </td>
+            </tr>`;
+    }).join("") : `<tr><td colspan="6" class="py-4 text-gray-500">No subtitles yet.</td></tr>`;
+
+    return `
+        <section class="space-y-4">
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead class="text-xs text-gray-500">
+                        <tr>
+                            <th class="py-2">Label</th>
+                            <th class="py-2">Language</th>
+                            <th class="py-2">Format</th>
+                            <th class="py-2">Default</th>
+                            <th class="py-2">Playback</th>
+                            <th class="py-2">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            </div>
+            <div class="border border-gray-800 rounded p-3 space-y-3">
+                <div class="text-sm font-semibold text-gray-200">Upload Subtitle</div>
+                <input id="subtitle-file-input" type="file" accept=".srt,.vtt,.ass" class="block w-full text-xs text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-cyan-700 file:text-white">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <label class="block text-xs text-gray-400">Language
+                        <select id="subtitle-language" class="mt-1 w-full bg-gray-950 border border-gray-700 rounded px-2 py-1 text-gray-100">
+                            <option value="ar">Arabic</option>
+                            <option value="en">English</option>
+                            <option value="ja">Japanese</option>
+                            <option value="unknown">Unknown</option>
+                        </select>
+                    </label>
+                    ${fieldInput("subtitle-label", "Label", "Arabic")}
+                    <label class="flex items-end gap-2 text-xs text-gray-400 pb-2">
+                        <input id="subtitle-default" type="checkbox" class="accent-cyan-600">
+                        Default
+                    </label>
+                </div>
+                <div id="subtitle-status" class="text-xs text-gray-500"></div>
+                <button onclick="uploadSubtitle()" class="bg-cyan-700 text-white px-3 py-1 rounded text-xs font-semibold">Upload Subtitle</button>
             </div>
         </section>`;
 }
@@ -874,6 +1024,13 @@ function setInspectorMediaStatus(message, isError = false) {
     el.className = isError ? "text-xs text-red-400" : "text-xs text-green-400";
 }
 
+function setSubtitleStatus(message, isError = false) {
+    const el = document.getElementById("subtitle-status");
+    if (!el) return;
+    el.innerText = message;
+    el.className = isError ? "text-xs text-red-400" : "text-xs text-green-400";
+}
+
 async function saveMediaChanges() {
     const values = mediaContextValues();
     if (!values) return;
@@ -900,6 +1057,107 @@ async function saveMediaChanges() {
         setInspectorMediaStatus("Changes Saved");
     } catch (error) {
         setInspectorMediaStatus(`Save failed: ${error.message || error}`, true);
+    }
+}
+
+async function uploadSubtitle() {
+    if (!currentInspector?.file?.file_id) return;
+    const input = document.getElementById("subtitle-file-input");
+    if (!input?.files?.length) {
+        setSubtitleStatus("Choose a subtitle file first.", true);
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", input.files[0]);
+    formData.append("language", document.getElementById("subtitle-language")?.value || "unknown");
+    formData.append("label", document.getElementById("subtitle-label")?.value.trim() || "Subtitle");
+    formData.append("is_default", document.getElementById("subtitle-default")?.checked ? "true" : "false");
+
+    try {
+        setSubtitleStatus("Uploading subtitle...");
+        const response = await fetch(`${MASTER_URL}/api/media/files/${currentInspector.file.file_id}/subtitles`, {
+            method: "POST",
+            body: formData,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setSubtitleStatus(data.error || "Subtitle upload failed.", true);
+            return;
+        }
+        await refreshInspectorData();
+        currentInspectorTab = "subtitles";
+        renderFileInspector();
+        setSubtitleStatus(data.warning || "Subtitle uploaded.");
+    } catch (error) {
+        setSubtitleStatus(`Subtitle upload failed: ${error.message || error}`, true);
+    }
+}
+
+async function setDefaultSubtitle(subtitleId) {
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/subtitles/${subtitleId}/default`, {
+            method: "PATCH",
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setSubtitleStatus(data.error || "Could not set default subtitle.", true);
+            return;
+        }
+        await refreshInspectorData();
+        currentInspectorTab = "subtitles";
+        renderFileInspector();
+    } catch (error) {
+        setSubtitleStatus(`Could not set default subtitle: ${error.message || error}`, true);
+    }
+}
+
+async function deleteSubtitle(subtitleId) {
+    if (!confirm("Delete this subtitle from the player? The file is kept on disk for now.")) return;
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/subtitles/${subtitleId}`, {
+            method: "DELETE",
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setSubtitleStatus(data.error || "Could not delete subtitle.", true);
+            return;
+        }
+        await refreshInspectorData();
+        currentInspectorTab = "subtitles";
+        renderFileInspector();
+    } catch (error) {
+        setSubtitleStatus(`Could not delete subtitle: ${error.message || error}`, true);
+    }
+}
+
+async function deleteSelectedCollection() {
+    const select = document.getElementById("inspector-collection");
+    const collectionId = readOptionalInt("inspector-collection");
+    if (!select || !collectionId) {
+        setInspectorMediaStatus("Select an existing collection first.", true);
+        return;
+    }
+
+    const label = select.selectedOptions?.[0]?.textContent || `collection ${collectionId}`;
+    if (!confirm(`Delete collection "${label}"? Only empty collections can be deleted.`)) return;
+
+    try {
+        const response = await fetch(`${MASTER_URL}/api/media/collections/${collectionId}`, {
+            method: "DELETE",
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setInspectorMediaStatus(data.message || data.error || "Collection could not be deleted.", true);
+            return;
+        }
+
+        mediaCollections = (mediaCollections || []).filter((collection) => Number(collection.collection_id) !== collectionId);
+        setInspectorMediaStatus("Collection deleted.");
+        await refreshInspectorData();
+        await refreshDashboard();
+    } catch (error) {
+        setInspectorMediaStatus(`Delete collection failed: ${error.message || error}`, true);
     }
 }
 
@@ -939,11 +1197,12 @@ async function rejectDraftFromInspector() {
 
 async function refreshInspectorData() {
     if (!currentInspector?.file?.file_id) return;
-    const [file, media] = await Promise.all([
+    const [file, media, subtitles] = await Promise.all([
         fetchJsonOrThrow(`${MASTER_URL}/api/files/${currentInspector.file.file_id}`),
         fetchJsonOrThrow(`${MASTER_URL}/api/media/files/${currentInspector.file.file_id}`),
+        fetchJsonOrThrow(`${MASTER_URL}/api/media/files/${currentInspector.file.file_id}/subtitles`),
     ]);
-    currentInspector = { file, media };
+    currentInspector = { file, media, subtitles: subtitles.subtitles || [] };
     renderFileInspector();
 }
 
@@ -974,7 +1233,7 @@ function setUploadState(message, busy = false) {
     const status = document.getElementById("upload-status");
     const fileInput = document.getElementById("file-input");
     const submitButton = document.querySelector("#upload-form button[type='submit']");
-    if (status) status.innerText = message || "";
+    if (status && message !== null) status.innerText = message || "";
     if (fileInput) fileInput.disabled = busy;
     if (submitButton) submitButton.disabled = busy;
     if (submitButton) submitButton.classList.toggle("opacity-60", busy);
@@ -986,7 +1245,30 @@ async function getStorageNodeStatus() {
     return response.json();
 }
 
-function uploadWithProgress(formData, file) {
+function renderUploadQueue(files) {
+    const status = document.getElementById("upload-status");
+    if (!status) return;
+    status.innerHTML = files.map((file, index) => `
+        <div id="upload-file-${index}" class="py-1 text-xs text-gray-400">
+            ${escapeHtml(file.name)} - queued
+        </div>
+    `).join("");
+}
+
+function setUploadFileStatus(index, message, isError = false) {
+    const row = document.getElementById(`upload-file-${index}`);
+    if (!row) return;
+    row.innerText = message;
+    row.className = isError ? "py-1 text-xs text-red-400" : "py-1 text-xs text-gray-300";
+}
+
+function appendUploadSummary(message) {
+    const status = document.getElementById("upload-status");
+    if (!status) return;
+    status.insertAdjacentHTML("beforeend", `<div class="pt-2 text-xs text-cyan-300">${escapeHtml(message)}</div>`);
+}
+
+function uploadWithProgress(formData, file, onProgress) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", `${NODE_URL}/api/files/cache`);
@@ -994,15 +1276,15 @@ function uploadWithProgress(formData, file) {
 
         xhr.upload.addEventListener("progress", (event) => {
             if (!event.lengthComputable) {
-                setUploadState(`Uploading ${file.name}...`, true);
+                onProgress(`Uploading ${file.name}...`);
                 return;
             }
             const percent = Math.round((event.loaded / event.total) * 100);
-            setUploadState(`Uploading ${file.name}: ${percent}% (${formatBytes(event.loaded)} / ${formatBytes(event.total)})`, true);
+            onProgress(`Uploading ${file.name}: ${percent}% (${formatBytes(event.loaded)} / ${formatBytes(event.total)})`);
         });
 
         xhr.upload.addEventListener("load", () => {
-            setUploadState(`Upload sent. Hashing and registering ${file.name}...`, true);
+            onProgress(`Upload sent. Hashing and registering ${file.name}...`);
         });
 
         xhr.addEventListener("load", () => {
@@ -1029,49 +1311,61 @@ document.getElementById("upload-form").addEventListener("submit", async (event) 
     const fileInput = document.getElementById("file-input");
     if (!fileInput.files.length) return;
 
-    const file = fileInput.files[0];
-    setUploadState(`Checking storage space for ${file.name}...`, true);
+    const files = Array.from(fileInput.files);
+    setUploadState(null, true);
+    renderUploadQueue(files);
 
-    try {
-        const nodeStatus = await getStorageNodeStatus();
-        if (nodeStatus && file.size > Number(nodeStatus.shared_space_free_bytes || 0)) {
-            setUploadState(`Not enough Shared Space. File: ${formatBytes(file.size)}, free: ${formatBytes(nodeStatus.shared_space_free_bytes)}.`);
-            return;
-        }
-    } catch (error) {
-        setUploadState("Could not check storage space. Uploading anyway...", true);
-    }
+    let uploaded = 0;
+    let failed = 0;
 
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("owner", "Web_UI_User");
-    formData.append("location_type", "CACHED");
+    for (const [index, file] of files.entries()) {
+        setUploadFileStatus(index, `Checking storage space for ${file.name}...`);
 
-    try {
-        const { ok, status, data } = await uploadWithProgress(formData, file);
-        if (ok) {
-            setUploadState(`Uploaded ${file.name}.`);
-            fileInput.value = "";
-            refreshDashboard();
-            alert(`Upload complete. Type: ${data.media_type || "unknown"}`);
-            return;
+        try {
+            const nodeStatus = await getStorageNodeStatus();
+            if (nodeStatus && file.size > Number(nodeStatus.shared_space_free_bytes || 0)) {
+                failed += 1;
+                setUploadFileStatus(
+                    index,
+                    `Skipped ${file.name}: not enough Shared Space. File: ${formatBytes(file.size)}, free: ${formatBytes(nodeStatus.shared_space_free_bytes)}.`,
+                    true,
+                );
+                continue;
+            }
+        } catch (error) {
+            setUploadFileStatus(index, `Could not check storage space for ${file.name}. Uploading anyway...`);
         }
 
-        const details = data.free_bytes !== undefined
-            ? ` Free: ${formatBytes(data.free_bytes)}, incoming: ${formatBytes(data.incoming_bytes)}.`
-            : "";
-        setUploadState(`Upload failed (${status}): ${data.error || "unknown error"}.${details}`);
-        alert(`Upload failed (${status}): ${data.error || "unknown error"}`);
-    } catch (error) {
-        setUploadState(`Upload failed: ${error.message || error}`);
-        alert(`Upload failed: ${error.message || error}`);
-    } finally {
-        const status = document.getElementById("upload-status");
-        setUploadState(status ? status.innerText : "", false);
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("owner", "Web_UI_User");
+        formData.append("location_type", "CACHED");
+
+        try {
+            const result = await uploadWithProgress(formData, file, (message) => setUploadFileStatus(index, message));
+            if (result.ok) {
+                uploaded += 1;
+                setUploadFileStatus(index, `Uploaded ${file.name}. Type: ${result.data.media_type || "unknown"}.`);
+            } else {
+                failed += 1;
+                const details = result.data.free_bytes !== undefined
+                    ? ` Free: ${formatBytes(result.data.free_bytes)}, incoming: ${formatBytes(result.data.incoming_bytes)}.`
+                    : "";
+                setUploadFileStatus(index, `Failed ${file.name} (${result.status}): ${result.data.error || "unknown error"}.${details}`, true);
+            }
+        } catch (error) {
+            failed += 1;
+            setUploadFileStatus(index, `Failed ${file.name}: ${error.message || error}`, true);
+        }
     }
+
+    fileInput.value = "";
+    appendUploadSummary(`Batch upload finished. Uploaded: ${uploaded}, failed: ${failed}.`);
+    setUploadState(null, false);
+    refreshDashboard();
 });
 
-document.getElementById("upload-form").addEventListener("submit", async (event) => {
+if (false) document.getElementById("upload-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const fileInput = document.getElementById("file-input");
     if (!fileInput.files.length) return;

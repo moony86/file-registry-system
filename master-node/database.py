@@ -285,6 +285,54 @@ class Database:
                 )
             """)
 
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS media_technical_metadata (
+                    content_hash VARCHAR(64) PRIMARY KEY REFERENCES contents(content_hash) ON DELETE CASCADE,
+                    duration_seconds DOUBLE PRECISION,
+                    width INTEGER,
+                    height INTEGER,
+                    video_codec VARCHAR(100),
+                    audio_codec VARCHAR(100),
+                    audio_channels INTEGER,
+                    bitrate BIGINT,
+                    fps DOUBLE PRECISION,
+                    format_name VARCHAR(200),
+                    probe_status VARCHAR(30) DEFAULT 'unknown',
+                    probe_error TEXT,
+                    probed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS media_thumbnails (
+                    content_hash VARCHAR(64) PRIMARY KEY REFERENCES contents(content_hash) ON DELETE CASCADE,
+                    thumbnail_path VARCHAR(1000),
+                    thumbnail_status VARCHAR(30) DEFAULT 'skipped',
+                    width INTEGER,
+                    height INTEGER,
+                    generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    error_message TEXT
+                )
+            """)
+
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS subtitle_tracks (
+                    subtitle_id SERIAL PRIMARY KEY,
+                    file_id UUID NOT NULL REFERENCES file_aliases(file_id) ON DELETE CASCADE,
+                    content_hash VARCHAR(64),
+                    subtitle_file_name VARCHAR(500),
+                    subtitle_format VARCHAR(20) DEFAULT 'unknown',
+                    language VARCHAR(50) DEFAULT 'unknown',
+                    label VARCHAR(100),
+                    is_default BOOLEAN DEFAULT FALSE,
+                    storage_path TEXT NOT NULL,
+                    vtt_path TEXT,
+                    status VARCHAR(30) DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    deleted_at TIMESTAMP
+                )
+            """)
+
             conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_id INTEGER REFERENCES media_collections(collection_id)")
             conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_title VARCHAR(500)")
             conn.run("ALTER TABLE media_drafts ADD COLUMN IF NOT EXISTS collection_type VARCHAR(50) DEFAULT 'unknown'")
@@ -307,6 +355,9 @@ class Database:
             conn.run("CREATE INDEX IF NOT EXISTS idx_media_items_kind_title ON media_items(media_kind, title)")
             conn.run("CREATE INDEX IF NOT EXISTS idx_media_items_collection_order ON media_items(collection_id, season_number, episode_number, display_order)")
             conn.run("CREATE INDEX IF NOT EXISTS idx_media_collections_type_title ON media_collections(collection_type, title)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_media_technical_metadata_status ON media_technical_metadata(probe_status)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_media_thumbnails_status ON media_thumbnails(thumbnail_status)")
+            conn.run("CREATE INDEX IF NOT EXISTS idx_subtitle_tracks_file_status ON subtitle_tracks(file_id, status)")
 
     # ========== Node Management ==========
     def register_node(self, node_id, host, port, shared_space_enabled=False,
@@ -511,6 +562,279 @@ class Database:
             self._upsert_content_location_in_tx(
                 conn, content_hash, node_id, physical_path, location_type, is_primary
             )
+
+    def upsert_technical_metadata(self, content_hash, metadata):
+        if not content_hash or not metadata:
+            return False
+
+        def clean_int(value):
+            if value in (None, ""):
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        def clean_float(value):
+            if value in (None, ""):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        probe_status = metadata.get("probe_status") or "unknown"
+        if probe_status not in {"success", "failed", "unavailable", "skipped", "unknown"}:
+            probe_status = "unknown"
+
+        self._execute("""
+            INSERT INTO media_technical_metadata (
+                content_hash, duration_seconds, width, height, video_codec,
+                audio_codec, audio_channels, bitrate, fps, format_name,
+                probe_status, probe_error, probed_at
+            )
+            VALUES (
+                :content_hash, :duration_seconds, :width, :height, :video_codec,
+                :audio_codec, :audio_channels, :bitrate, :fps, :format_name,
+                :probe_status, :probe_error, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (content_hash)
+            DO UPDATE SET
+                duration_seconds = EXCLUDED.duration_seconds,
+                width = EXCLUDED.width,
+                height = EXCLUDED.height,
+                video_codec = EXCLUDED.video_codec,
+                audio_codec = EXCLUDED.audio_codec,
+                audio_channels = EXCLUDED.audio_channels,
+                bitrate = EXCLUDED.bitrate,
+                fps = EXCLUDED.fps,
+                format_name = EXCLUDED.format_name,
+                probe_status = EXCLUDED.probe_status,
+                probe_error = EXCLUDED.probe_error,
+                probed_at = CURRENT_TIMESTAMP
+        """,
+            content_hash=content_hash,
+            duration_seconds=clean_float(metadata.get("duration_seconds")),
+            width=clean_int(metadata.get("width")),
+            height=clean_int(metadata.get("height")),
+            video_codec=metadata.get("video_codec"),
+            audio_codec=metadata.get("audio_codec"),
+            audio_channels=clean_int(metadata.get("audio_channels")),
+            bitrate=clean_int(metadata.get("bitrate")),
+            fps=clean_float(metadata.get("fps")),
+            format_name=metadata.get("format_name"),
+            probe_status=probe_status,
+            probe_error=metadata.get("probe_error"),
+        )
+        return True
+
+    def get_technical_metadata(self, content_hash):
+        rows = self._fetch_all("""
+            SELECT
+                content_hash, duration_seconds, width, height, video_codec,
+                audio_codec, audio_channels, bitrate, fps, format_name,
+                probe_status, probe_error, probed_at
+            FROM media_technical_metadata
+            WHERE content_hash = :content_hash
+            LIMIT 1
+        """, content_hash=content_hash)
+        if not rows:
+            return None
+
+        columns = [
+            'content_hash', 'duration_seconds', 'width', 'height', 'video_codec',
+            'audio_codec', 'audio_channels', 'bitrate', 'fps', 'format_name',
+            'probe_status', 'probe_error', 'probed_at'
+        ]
+        return dict(zip(columns, rows[0]))
+
+    def upsert_thumbnail_metadata(self, content_hash, metadata):
+        if not content_hash or not metadata:
+            return False
+
+        def clean_int(value):
+            if value in (None, ""):
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        thumbnail_status = metadata.get("thumbnail_status") or metadata.get("status") or "skipped"
+        if thumbnail_status not in {"success", "failed", "unavailable", "skipped"}:
+            thumbnail_status = "skipped"
+
+        self._execute("""
+            INSERT INTO media_thumbnails (
+                content_hash, thumbnail_path, thumbnail_status,
+                width, height, generated_at, error_message
+            )
+            VALUES (
+                :content_hash, :thumbnail_path, :thumbnail_status,
+                :width, :height, CURRENT_TIMESTAMP, :error_message
+            )
+            ON CONFLICT (content_hash)
+            DO UPDATE SET
+                thumbnail_path = EXCLUDED.thumbnail_path,
+                thumbnail_status = EXCLUDED.thumbnail_status,
+                width = EXCLUDED.width,
+                height = EXCLUDED.height,
+                generated_at = CURRENT_TIMESTAMP,
+                error_message = EXCLUDED.error_message
+        """,
+            content_hash=content_hash,
+            thumbnail_path=metadata.get("thumbnail_path"),
+            thumbnail_status=thumbnail_status,
+            width=clean_int(metadata.get("width")),
+            height=clean_int(metadata.get("height")),
+            error_message=metadata.get("error_message") or metadata.get("error"),
+        )
+        return True
+
+    def get_thumbnail_metadata(self, content_hash):
+        rows = self._fetch_all("""
+            SELECT
+                content_hash, thumbnail_path, thumbnail_status,
+                width, height, generated_at, error_message
+            FROM media_thumbnails
+            WHERE content_hash = :content_hash
+            LIMIT 1
+        """, content_hash=content_hash)
+        if not rows:
+            return None
+
+        columns = [
+            'content_hash', 'thumbnail_path', 'thumbnail_status',
+            'width', 'height', 'generated_at', 'error_message'
+        ]
+        return dict(zip(columns, rows[0]))
+
+    def get_file_content_hash(self, file_id):
+        rows = self._fetch_all("""
+            SELECT fa.content_hash
+            FROM file_aliases fa
+            WHERE fa.file_id = :file_id
+            LIMIT 1
+        """, file_id=file_id)
+        return rows[0][0] if rows else None
+
+    def list_subtitle_tracks(self, file_id, include_deleted=False):
+        status_filter = "" if include_deleted else "AND status = 'active'"
+        rows = self._fetch_all(f"""
+            SELECT
+                subtitle_id, file_id, content_hash, subtitle_file_name,
+                subtitle_format, language, label, is_default,
+                storage_path, vtt_path, status, created_at, deleted_at
+            FROM subtitle_tracks
+            WHERE file_id = :file_id
+              {status_filter}
+            ORDER BY is_default DESC, created_at ASC
+        """, file_id=file_id)
+        columns = [
+            'subtitle_id', 'file_id', 'content_hash', 'subtitle_file_name',
+            'subtitle_format', 'language', 'label', 'is_default',
+            'storage_path', 'vtt_path', 'status', 'created_at', 'deleted_at'
+        ]
+        return [dict(zip(columns, row)) for row in rows]
+
+    def create_subtitle_track(self, file_id, content_hash, subtitle_file_name,
+                              subtitle_format, language, label, is_default,
+                              storage_path, vtt_path=None):
+        subtitle_format = subtitle_format if subtitle_format in {"srt", "vtt", "ass", "unknown"} else "unknown"
+        language = (language or "unknown").strip() or "unknown"
+        label = (label or language or "Unknown").strip() or "Unknown"
+        is_default = bool(is_default)
+
+        with self._transaction() as conn:
+            if is_default:
+                conn.run("""
+                    UPDATE subtitle_tracks
+                    SET is_default = FALSE
+                    WHERE file_id = :file_id
+                      AND status = 'active'
+                """, file_id=file_id)
+
+            rows = conn.run("""
+                INSERT INTO subtitle_tracks (
+                    file_id, content_hash, subtitle_file_name, subtitle_format,
+                    language, label, is_default, storage_path, vtt_path, status
+                )
+                VALUES (
+                    :file_id, :content_hash, :subtitle_file_name, :subtitle_format,
+                    :language, :label, :is_default, :storage_path, :vtt_path, 'active'
+                )
+                RETURNING subtitle_id
+            """,
+                file_id=file_id,
+                content_hash=content_hash,
+                subtitle_file_name=subtitle_file_name,
+                subtitle_format=subtitle_format,
+                language=language,
+                label=label,
+                is_default=is_default,
+                storage_path=storage_path,
+                vtt_path=vtt_path,
+            ) or []
+
+        return rows[0][0] if rows else None
+
+    def get_subtitle_track(self, subtitle_id):
+        rows = self._fetch_all("""
+            SELECT
+                subtitle_id, file_id, content_hash, subtitle_file_name,
+                subtitle_format, language, label, is_default,
+                storage_path, vtt_path, status, created_at, deleted_at
+            FROM subtitle_tracks
+            WHERE subtitle_id = :subtitle_id
+            LIMIT 1
+        """, subtitle_id=subtitle_id)
+        if not rows:
+            return None
+        columns = [
+            'subtitle_id', 'file_id', 'content_hash', 'subtitle_file_name',
+            'subtitle_format', 'language', 'label', 'is_default',
+            'storage_path', 'vtt_path', 'status', 'created_at', 'deleted_at'
+        ]
+        return dict(zip(columns, rows[0]))
+
+    def soft_delete_subtitle_track(self, subtitle_id):
+        with self._transaction() as conn:
+            rows = conn.run("""
+                UPDATE subtitle_tracks
+                SET status = 'deleted',
+                    is_default = FALSE,
+                    deleted_at = CURRENT_TIMESTAMP
+                WHERE subtitle_id = :subtitle_id
+                  AND status = 'active'
+                RETURNING subtitle_id
+            """, subtitle_id=subtitle_id) or []
+        return bool(rows)
+
+    def set_default_subtitle_track(self, subtitle_id):
+        with self._transaction() as conn:
+            rows = conn.run("""
+                SELECT file_id
+                FROM subtitle_tracks
+                WHERE subtitle_id = :subtitle_id
+                  AND status = 'active'
+                LIMIT 1
+            """, subtitle_id=subtitle_id) or []
+            if not rows:
+                return False
+
+            file_id = rows[0][0]
+            conn.run("""
+                UPDATE subtitle_tracks
+                SET is_default = FALSE
+                WHERE file_id = :file_id
+                  AND status = 'active'
+            """, file_id=file_id)
+            conn.run("""
+                UPDATE subtitle_tracks
+                SET is_default = TRUE
+                WHERE subtitle_id = :subtitle_id
+            """, subtitle_id=subtitle_id)
+        return True
 
     def update_content_location_path(self, location_id, physical_path, location_type=None):
         if not location_id or not physical_path:
@@ -959,6 +1283,58 @@ class Database:
             "collections": self.list_media_collections(),
         }
 
+    def get_media_neighbors(self, file_id):
+        current_rows = self._fetch_all("""
+            SELECT
+                mi.collection_id,
+                COALESCE(mi.season_number, mi.season, 1) AS season_number,
+                mi.episode_number
+            FROM media_items mi
+            JOIN file_aliases fa ON mi.file_id = fa.file_id
+            WHERE mi.file_id = :file_id
+              AND COALESCE(fa.file_status, 'ACTIVE') = 'ACTIVE'
+            LIMIT 1
+        """, file_id=file_id)
+        if not current_rows:
+            return {"previous": None, "next": None}
+
+        collection_id, season_number, episode_number = current_rows[0]
+        if not collection_id or episode_number is None:
+            return {"previous": None, "next": None}
+
+        def fetch_neighbor(target_episode):
+            rows = self._fetch_all("""
+                SELECT
+                    mi.media_id, mi.file_id, mi.content_hash, mi.media_kind,
+                    mi.title, mi.year, mi.season, mi.episode, mi.language,
+                    mi.collection_id, mc.title AS collection_title, mc.collection_type,
+                    mi.season_number, mi.episode_number, mi.display_order,
+                    mi.created_at, mi.updated_at,
+                    fa.file_name, fa.owner, fa.file_status,
+                    c.size_bytes, c.mime_type, c.media_type,
+                    COALESCE(bool_or(sn.status = 'ONLINE'), FALSE) AS is_available
+                FROM media_items mi
+                JOIN file_aliases fa ON mi.file_id = fa.file_id
+                JOIN contents c ON mi.content_hash = c.content_hash
+                LEFT JOIN content_locations cl ON mi.content_hash = cl.content_hash
+                LEFT JOIN storage_nodes sn ON cl.node_id = sn.node_id
+                LEFT JOIN media_collections mc ON mi.collection_id = mc.collection_id
+                WHERE mi.collection_id = :collection_id
+                  AND COALESCE(mi.season_number, mi.season, 1) = :season_number
+                  AND mi.episode_number = :episode_number
+                  AND COALESCE(fa.file_status, 'ACTIVE') = 'ACTIVE'
+                GROUP BY mi.media_id, fa.file_id, c.content_hash, mc.collection_id
+                LIMIT 1
+            """, collection_id=collection_id, season_number=season_number,
+                 episode_number=target_episode)
+            items = self._media_item_rows_to_dicts(rows)
+            return items[0] if items else None
+
+        return {
+            "previous": fetch_neighbor(int(episode_number) - 1),
+            "next": fetch_neighbor(int(episode_number) + 1),
+        }
+
     def update_media_item_for_file(self, file_id, media_kind=None, title=None,
                                    collection_id=None, collection_title=None,
                                    collection_type="unknown", season_number=None,
@@ -1005,12 +1381,59 @@ class Database:
 
     def list_media_collections(self):
         rows = self._fetch_all("""
-            SELECT collection_id, title, collection_type, created_at, updated_at
-            FROM media_collections
-            ORDER BY collection_type, title
+            SELECT
+                mc.collection_id,
+                mc.title,
+                mc.collection_type,
+                mc.created_at,
+                mc.updated_at,
+                COUNT(mi.media_id) AS item_count
+            FROM media_collections mc
+            LEFT JOIN media_items mi ON mc.collection_id = mi.collection_id
+            GROUP BY mc.collection_id
+            ORDER BY mc.collection_type, mc.title
         """)
-        columns = ['collection_id', 'title', 'collection_type', 'created_at', 'updated_at']
+        columns = ['collection_id', 'title', 'collection_type', 'created_at', 'updated_at', 'item_count']
         return [dict(zip(columns, row)) for row in rows]
+
+    def delete_media_collection(self, collection_id):
+        with self._transaction() as conn:
+            rows = conn.run("""
+                SELECT collection_id, title, collection_type
+                FROM media_collections
+                WHERE collection_id = :collection_id
+                LIMIT 1
+            """, collection_id=collection_id) or []
+            if not rows:
+                return {"deleted": False, "status": "not_found", "message": "Collection not found"}
+
+            item_rows = conn.run("""
+                SELECT COUNT(*)
+                FROM media_items
+                WHERE collection_id = :collection_id
+            """, collection_id=collection_id) or [(0,)]
+            item_count = int(item_rows[0][0])
+            if item_count > 0:
+                return {
+                    "deleted": False,
+                    "status": "not_empty",
+                    "item_count": item_count,
+                    "message": f"Collection has {item_count} media item(s). Remove or move them before deleting.",
+                }
+
+            conn.run("""
+                UPDATE media_drafts
+                SET collection_id = NULL
+                WHERE collection_id = :collection_id
+            """, collection_id=collection_id)
+
+            conn.run("""
+                DELETE FROM media_collections
+                WHERE collection_id = :collection_id
+            """, collection_id=collection_id)
+
+        collection = dict(zip(['collection_id', 'title', 'collection_type'], rows[0]))
+        return {"deleted": True, "status": "deleted", "collection": collection}
 
     def create_media_collection(self, title, collection_type="unknown"):
         title = (title or "").strip()

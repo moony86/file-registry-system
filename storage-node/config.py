@@ -11,6 +11,7 @@ MASTER_URL = os.getenv("MASTER_URL", "http://localhost:5000")
 NODE_TOKEN = os.getenv("FSYS_NODE_TOKEN", "dev-token")
 
 SHARED_SPACE_DIR = Path(os.getenv("SHARED_SPACE_DIR", "./shared_space")).resolve()
+THUMBNAILS_DIR = Path(os.getenv("THUMBNAILS_DIR", "./thumbnails")).resolve()
 SHARED_SPACE_LIMIT_BYTES = int(os.getenv("SHARED_SPACE_LIMIT_BYTES", str(1024 * 1024 * 1024)))
 SHARED_SPACE_ENABLED = os.getenv("SHARED_SPACE_ENABLED", "true").lower() in {"1", "true", "yes"}
 

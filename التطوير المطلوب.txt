@@ -1,358 +1,400 @@
-FSYS v0.6.4 Bug Fix – Media Inspector Source of Truth + Collection Duplication
+FSYS v0.7.3 – Immersive Viewing Experience / Cinema Mode
 
-المطلوب:
-فحص وتشخيص وإصلاح مشكلة Media Inspector / Media Review بعد v0.6.4.
+الهدف:
+تحسين تجربة المشاهدة في FSYS وتحويل التشغيل من مجرد video داخل Modal إلى تجربة Home Theater حقيقية.
 
-لا تضف Features جديدة.
-لا تعيد تصميم الواجهة.
-لا تغير Upload/Delete/Restore/Stream.
-لا تغير Storage Node.
-لا تضف AI أو scraping.
-لا تغير قاعدة البيانات جذرياً.
-المطلوب فقط: فحص السبب الجذري وإصلاحه بأقل تعديل آمن.
+لا تضف:
+- AI
+- Recommendations
+- Watch History
+- Continue Watching
+- User Accounts
+- Comments
+- Chat
+- Scraping
+- TMDB / Anilist
+- تغيير Streaming Backend
+- تغيير Subtitle Backend
+- تغيير Upload/Delete/Restore
+
+المطلوب فقط:
+واجهة مشاهدة مستقلة ومريحة للمستخدم.
 
 ==================================================
 السياق
 ==================================================
 
-المشروع FSYS:
-Home Media Server + File Registry
-
-تم تنفيذ:
-- Media Drafts
-- Media Items
-- Media Collections
-- File Inspector داخل Details
-- Media Tab لتعديل بيانات العمل/الحلقة
+FSYS حالياً يدعم:
+- Upload
 - Media Library
+- Streaming
+- Subtitles
+- Thumbnails
+- ffprobe metadata
+- Delete/Restore
+- File Inspector
 
-المشكلة ظهرت بعد رفع حلقات أنمي وربطها بـ Collection.
-
-مثال ملف:
-[Witanime.com] YNT EP 01 FHD.mp4
-
-الـ API يرجع:
-
-media.draft موجود
-media.item موجود
-
-الـ draft قديم/جزئي.
-الـ item يحتوي البيانات الصحيحة.
+المشكلة:
+التشغيل الحالي يعمل، لكنه لا يعطي تجربة مشاهدة مريحة.
+المطلوب إنشاء صفحة مشاهدة مخصصة.
 
 ==================================================
-المشكلة الحالية
+1) Watch Page
 ==================================================
 
-في Inspector / Media Tab:
+أضف صفحة جديدة:
 
-- أحياناً تظهر الحقول كأنها unknown أو فاضية.
-- رغم أن media_item يحتوي بيانات صحيحة.
-- عند approved item، الواجهة لا تزال تعرض New Collection Title.
-- يوجد Collection مكرر:
-  Yofukashi no Uta (unknown)
-  Yofukashi no Uta (anime)
+GET /watch/<file_id>
 
-مثال من JSON:
+أو route مناسب داخل Master.
 
-draft:
-- review_status = approved
-- final_media_kind = anime_episode
-- suggested_media_kind = unknown
-- collection_id = null
-- collection_title = null
-- season = 1
-- season_number = null
-- episode_number = null
+هذه الصفحة ليست Dashboard.
 
-item:
-- media_kind = anime_episode
-- collection_id = 2
-- collection_title = Yofukashi no Uta
-- collection_type = anime
-- season_number = 1
-- episode_number = 1
-- title = [Witanime com] YNT EP 01 FHD
+يجب أن تكون:
+- Dark
+- Clean
+- Fullscreen-friendly
+- بدون جداول
+- بدون أدوات إدارة
 
-collections:
-- collection_id = 2, title = Yofukashi no Uta, type = anime
-- collection_id = 1, title = Yofukashi no Uta, type = unknown
-
-هذا يعني أن البيانات الصحيحة موجودة في media_item، لكن الواجهة أو API قد تعرض/تقرأ draft القديم.
+عند فتحها:
+- تجلب بيانات الملف
+- تجلب media metadata
+- تجلب subtitles
+- تبني stream URL من node
+- تعرض video player
 
 ==================================================
-الهدف
+2) Cinema Mode UI
 ==================================================
 
-إصلاح Media Inspector بحيث:
+التصميم:
 
-1. إذا media.item موجود:
-   يكون هو مصدر الحقيقة للعرض والتعديل.
+- خلفية سوداء أو قريبة من الأسود.
+- الفيديو في الوسط.
+- معلومات بسيطة فوق أو تحت الفيديو.
+- لا تعرض hashes أو paths أو node info.
+- زر Back to Library.
+- زر Back to Dashboard اختياري صغير.
 
-2. إذا media.item غير موجود وdraft pending:
-   يكون draft هو مصدر العرض والموافقة.
+إذا يوجد thumbnail:
+استخدمه كخلفية ambient:
+- blurred
+- dark overlay
+- brightness منخفض
 
-3. إذا draft approved وله item:
-   لا تستخدم draft لملء حقول التعديل إلا للقراءة الثانوية/Debug.
-
-4. لا تظهر New Collection Title عندما الملف مرتبط بـ Collection موجودة إلا إذا ضغط المستخدم Create New أو Change Collection.
-
-5. لا تظهر unknown إذا item يحتوي قيمة صحيحة.
-
-6. منع أو تقليل تكرار Collections بنفس العنوان.
-
-==================================================
-المطلوب فحصه
-==================================================
-
-افحص الملفات التالية:
-
-- master-node/routes/media.py
-- master-node/database.py
-- master-node/static/js/dashboard.js
-- master-node/templates/dashboard.html
-
-لا تفحص المشروع كله إلا إذا احتجت.
+إذا لا يوجد thumbnail:
+خلفية سوداء عادية.
 
 ==================================================
-Trace مطلوب
+3) Video Info
 ==================================================
 
-تتبع flow:
+اعرض فوق أو أسفل الفيديو:
 
-GET /api/media/files/<file_id>
-↓
-dashboard.js
-↓
-renderMediaTab أو ما يعادلها
-↓
-form fields
-↓
-Save Changes / Approve
-↓
-PATCH /api/media/files/<file_id> أو approve endpoint
-↓
-DB update
-↓
-refresh
-↓
-render again
-
-حدد بالضبط:
-
-1. هل UI يستخدم item أم draft عندما الاثنين موجودين؟
-2. هل اختيار collection يأخذ collection_id الصحيح؟
-3. هل New Collection input يسبب إنشاء duplicate؟
-4. هل PATCH يحدث media_item الصحيح؟
-5. هل approve ينشئ collection مكررة؟
-6. هل library grouping يعتمد على collection_id أم title فقط؟
-
-==================================================
-قواعد الإصلاح
-==================================================
-
-## Rule 1: Source of Truth داخل Inspector
-
-إذا response يحتوي:
-
-media.item != null
-
-فالـ Media Tab يجب أن يقرأ من:
-
-media.item
-
-وليس:
-
-media.draft
-
-القيم التي يجب أن تأتي من item:
-- media_kind
-- collection_id
-- collection_title
-- collection_type
-- season_number
-- episode_number
-- title
-- year
-- language
-
-أما draft يستخدم فقط إذا:
-
-media.item == null
-
-==================================================
-
-## Rule 2: Pending Draft فقط
-
-إذا:
-
-media.item == null
-و
-media.draft.review_status == pending
-
-اعرض واجهة approve draft.
-
-==================================================
-
-## Rule 3: Approved Draft with Item
-
-إذا:
-
-draft.review_status == approved
-و
-item موجود
-
-اعرض:
-
-Mode: item
-
-ولا تعرض controls الخاصة بإنشاء draft جديد إلا إذا المستخدم يضغط edit/change.
-
-==================================================
-
-## Rule 4: Collection UI
-
-في حالة item موجود:
-
-اعرض:
-Current Collection:
-Yofukashi no Uta (anime)
-
-مع select لتغيير collection فقط.
-
-لا تعرض New Collection Title بشكل دائم.
-
-اجعل New Collection Title يظهر فقط إذا:
-- selected collection value = "__new__"
-أو المستخدم ضغط:
-Create New Collection
-
-==================================================
-
-## Rule 5: Duplicate Collections
-
-افحص منطق إنشاء collection.
-
-إذا المستخدم يرسل:
-title = Yofukashi no Uta
-collection_type = anime
-
-وكانت موجودة:
-Yofukashi no Uta + anime
-
-لا تنشئ نسخة جديدة.
-
-إذا كانت موجودة:
-Yofukashi no Uta + unknown
-
-وقام المستخدم بإنشاء:
-Yofukashi no Uta + anime
-
-هنا يوجد خياران:
-
-الخيار المقبول الآن:
-- اسمح بالفرق لأن type مختلف.
-- لكن في UI اعرض النوع بوضوح.
-
-الخيار الأفضل إن كان سهل:
-- عند إنشاء collection جديدة، إذا يوجد نفس title بنوع unknown، حدّثها إلى anime بدلاً من إنشاء واحدة جديدة.
-
-اختر الحل الأبسط والأكثر أماناً، واذكره في التقرير.
-
-==================================================
-إصلاح بيانات موجودة
-==================================================
-
-لا تحذف بيانات تلقائياً بدون وضوح.
-
-لكن يمكنك إضافة utility أو function صغيرة أو SQL suggestion لتنظيف التكرار:
+- Title
+- Collection title إن وجد
+- Season/Episode إن وجد
+- Duration إن وجد
+- Resolution إن وجد
+- Codec بشكل خفيف إن وجد
 
 مثال:
-- إذا يوجد Yofukashi no Uta unknown غير مستخدمة، يمكن حذفها أو دمجها يدوياً.
-- إذا media_items تشير إلى collection_id=2 الصحيح، لا تلمسها.
 
-لا تنفذ cleanup destructive تلقائي إلا إذا كان آمناً جداً.
+Yofukashi no Uta
+Season 1 • Episode 3
+1080p • 23m
 
-==================================================
-اختبار القبول
-==================================================
-
-استخدم الحالة الحالية:
-
-EP 01:
-media_item موجود:
-collection_id = 2
-collection_title = Yofukashi no Uta
-collection_type = anime
-season_number = 1
-episode_number = 1
-media_kind = anime_episode
-
-المطلوب بعد الإصلاح:
-
-1. افتح Details → Media.
-2. يجب أن يظهر:
-   - Mode: item
-   - Media Kind: anime_episode
-   - Collection: Yofukashi no Uta (anime)
-   - Season: 1
-   - Episode: 1
-   - Title من item
-3. لا يظهر New Collection Title إلا إذا اخترت Create New.
-4. Refresh لا يرجع unknown.
-5. Save Changes يحفظ على media_item ولا ينشئ item جديد.
-6. EP 02 يعرض episode_number = 2 إذا كان item يحتويها.
-7. Media Library تعرض Yofukashi no Uta مرة واحدة بقدر الإمكان.
-8. تحتها Season 1 وفيه Episode 1 و Episode 2.
+لا تعرض تفاصيل تقنية كثيرة.
 
 ==================================================
-اختبارات إضافية
+4) Player
 ==================================================
 
-اختبر pending draft جديد:
+استخدم stream endpoint الحالي.
+لا تغير backend.
 
-1. ارفع فيديو جديد.
-2. افتح Details → Media.
-3. لا يوجد item.
-4. يوجد draft pending.
-5. اعرض draft controls.
-6. اختر anime_episode.
-7. اختر collection موجودة.
-8. season/episode.
-9. Approve.
-10. بعد approve:
-    - item ينشأ.
-    - refresh يعرض Mode: item.
-    - القيم تبقى.
+يجب أن يدعم:
+- subtitles الحالية
+- controls
+- fullscreen
+- playback speed
+- volume persistence
 
-==================================================
-ممنوع
-==================================================
+عند تحميل الصفحة:
+- GET /api/files/<file_id>
+- GET /api/media/files/<file_id>
+- GET /api/media/files/<file_id>/subtitles
+- GET /api/files/<file_id>/location لبناء stream URL إن كان مطلوباً
 
-- لا تغير Stream.
-- لا تغير Upload.
-- لا تغير Delete/Restore.
-- لا تعيد تصميم Dashboard بالكامل.
-- لا تضف Viewer UI.
-- لا تضف AI.
-- لا تضف scraping.
-- لا تضف schema ضخم.
-- لا تنقل إلى SQLAlchemy.
+ثم:
+
+video.src = http://node-host:node-port/api/files/<file_id>/stream
 
 ==================================================
-Output المطلوب
+5) Subtitles
+==================================================
+
+إذا توجد ترجمة active ومدعومة:
+أضف <track> داخل video.
+
+لكل subtitle:
+src = /api/media/subtitles/<subtitle_id>/file
+label = label أو language
+srclang = language code إن أمكن
+default إذا is_default = true
+
+أضف خيار بسيط لعرض اللغات:
+- Arabic
+- English
+- Off
+
+إذا HTML5 controls كافية، لا تبالغ.
+
+==================================================
+6) Keyboard Shortcuts
+==================================================
+
+أضف shortcuts:
+
+Space:
+Play/Pause
+
+ArrowRight:
++10 seconds
+
+ArrowLeft:
+-10 seconds
+
+F:
+Fullscreen
+
+M:
+Mute/Unmute
+
+Escape:
+إذا fullscreen اخرج منه
+
+لا تجعل الاختصارات تعمل عندما المستخدم يكتب داخل input.
+
+==================================================
+7) Playback Settings LocalStorage
+==================================================
+
+احفظ محلياً:
+
+- volume
+- muted
+- playbackRate
+- selectedSubtitle إن أمكن
+
+LocalStorage keys تكون مثل:
+
+fsys.player.volume
+fsys.player.muted
+fsys.player.rate
+fsys.player.subtitle
+
+لا تحفظ watch position الآن.
+هذا مؤجل لـ Continue Watching.
+
+==================================================
+8) Playback Speed
+==================================================
+
+أضف selector بسيط:
+
+0.5x
+1x
+1.25x
+1.5x
+2x
+
+عند التغيير:
+- video.playbackRate = value
+- احفظها في LocalStorage
+
+==================================================
+9) Next / Previous Episode
+==================================================
+
+إذا الملف الحالي جزء من media_item داخل collection:
+
+اعثر على:
+- previous episode
+- next episode
+
+المنطق:
+نفس collection_id
+نفس season_number
+episode_number - 1
+episode_number + 1
+
+إذا لا توجد API حالية:
+أضف endpoint صغير في master-node/routes/media.py:
+
+GET /api/media/files/<file_id>/neighbors
+
+يرجع:
+
+{
+  "previous": {
+    "file_id": "...",
+    "title": "...",
+    "episode_number": 1
+  },
+  "next": {
+    "file_id": "...",
+    "title": "...",
+    "episode_number": 3
+  }
+}
+
+إذا الملف movie أو clip:
+previous/next = null
+
+في Watch Page:
+أظهر:
+← Previous Episode
+Next Episode →
+
+==================================================
+10) End-of-Episode Prompt
+==================================================
+
+اختياري إذا سهل:
+
+عندما يصل الفيديو إلى آخر 30 ثانية وكان next موجود:
+
+أظهر:
+Next Episode
+
+زر:
+Play Next
+
+لا تضف autoplay إلزامي.
+لا تعمل autoplay countdown معقد.
+
+إذا صعب:
+أجله واذكر أنه مؤجل.
+
+==================================================
+11) Navigation
+==================================================
+
+زر واضح:
+
+Back to Library
+
+يحاول الرجوع إلى:
+- collection page إن كانت موجودة
+- أو /anime
+- أو /
+- أو history.back()
+
+لا تكسر إذا لا يوجد source.
+
+==================================================
+12) Viewer Integration
+==================================================
+
+أي زر Play في Viewer أو Media Library يجب أن يفتح:
+
+/watch/<file_id>
+
+بدل modal القديم، أو يمكن ترك modal في Dashboard فقط.
+
+المطلوب:
+- Viewer user experience تستخدم watch page.
+- Admin Dashboard يمكن أن يبقى يستخدم modal أو watch page، اختر الأبسط.
+
+==================================================
+13) Mobile
+==================================================
+
+اجعل الصفحة responsive:
+
+- الفيديو يأخذ العرض الكامل تقريباً.
+- الأزرار تحت الفيديو.
+- النصوص لا تزاحم الفيديو.
+
+==================================================
+14) ملفات متوقعة للتعديل
+==================================================
+
+Master:
+- master-node/app.py أو routes/pages.py إن وجدت
+- master-node/templates/watch.html جديد
+- master-node/static/js/watch.js جديد
+- master-node/static/css/watch.css إن كان المشروع يستخدم CSS منفصل
+- master-node/routes/media.py لإضافة neighbors endpoint إن احتجت
+- master-node/static/js/viewer.js لتغيير Play links إلى /watch/<file_id>
+- master-node/static/js/dashboard.js فقط إذا لازم
+
+لا تعدل Storage Node.
+
+==================================================
+15) اختبارات القبول
+==================================================
+
+اختبر:
+
+1. فتح:
+/watch/<file_id>
+
+2. الفيديو يشتغل.
+
+3. الخلفية مظلمة ومريحة.
+
+4. subtitle تظهر إذا كانت موجودة.
+
+5. Space يشغل/يوقف.
+
+6. ArrowRight/ArrowLeft تقدم وترجع 10 ثواني.
+
+7. F fullscreen.
+
+8. M mute.
+
+9. تغيير السرعة يبقى بعد refresh.
+
+10. إذا الحلقة لها next:
+زر Next Episode يعمل.
+
+11. إذا الحلقة لها previous:
+زر Previous Episode يعمل.
+
+12. Play من Viewer يفتح watch page.
+
+13. Play لا ينكسر في Dashboard.
+
+==================================================
+16) ممنوع
+==================================================
+
+لا تضف:
+- Continue Watching
+- Watch progress
+- Database tracking للمشاهدة
+- Users
+- Profiles
+- Recommendations
+- External metadata
+- Player library خارجية مثل video.js حالياً
+
+استخدم HTML5 video.
+
+==================================================
+17) Output المطلوب
 ==================================================
 
 بعد التنفيذ أعطني:
 
-1. السبب الجذري.
-2. هل المشكلة كانت UI يقرأ draft بدل item؟
-3. هل كانت collection duplication من create logic؟
-4. الملفات المعدلة.
-5. APIs المعدلة إن وجدت.
-6. هل أضفت أو عدلت DB functions؟
-7. كيف أختبر EP 01 و EP 02.
-8. أي cleanup يدوي مقترح للتكرار الموجود:
-   Yofukashi no Uta unknown
-   Yofukashi no Uta anime
-
-نفذ هذا كـ bug fix فقط.
+1. الملفات المعدلة والجديدة.
+2. route الجديد للـ watch page.
+3. هل أضفت neighbors API.
+4. الاختصارات المدعومة.
+5. LocalStorage keys المستخدمة.
+6. كيف يعمل subtitle داخل watch page.
+7. كيف أختبر next/previous episode.
+8. أي شيء مؤجل.

@@ -7,6 +7,8 @@ from datetime import datetime
 
 from services.hashing import sha256_file, path_for_hash, safe_existing_file_path
 from services.media import detect_media_type
+from services.probe import probe_media_file
+from services.thumbnails import generate_thumbnail
 
 
 def create_files_blueprint(config, space_cache, master_client):
@@ -21,6 +23,11 @@ def create_files_blueprint(config, space_cache, master_client):
             return True
         except ValueError:
             return False
+
+    def thumbnail_path_for_hash(content_hash):
+        if not content_hash or len(content_hash) < 2:
+            return None
+        return config.THUMBNAILS_DIR / content_hash[:2] / f"{content_hash}.jpg"
 
 
     @bp.route("/register", methods=["POST"])
@@ -130,6 +137,31 @@ def create_files_blueprint(config, space_cache, master_client):
 
             mime_type = mimetypes.guess_type(original_name)[0] or "application/octet-stream"
             media_type = detect_media_type(mime_type, original_name)
+            technical_metadata = None
+            thumbnail_metadata = None
+            if media_type in {"video", "audio"}:
+                technical_metadata = probe_media_file(final_path)
+                if technical_metadata.get("probe_status") != "success":
+                    current_app.logger.warning(
+                        "ffprobe did not return successful metadata for %s: status=%s error=%s",
+                        final_path,
+                        technical_metadata.get("probe_status"),
+                        technical_metadata.get("probe_error"),
+                    )
+            if media_type == "video":
+                thumbnail_metadata = generate_thumbnail(
+                    final_path,
+                    content_hash,
+                    config.THUMBNAILS_DIR,
+                    duration_seconds=(technical_metadata or {}).get("duration_seconds"),
+                )
+                if thumbnail_metadata.get("thumbnail_status") != "success":
+                    current_app.logger.warning(
+                        "thumbnail generation did not succeed for %s: status=%s error=%s",
+                        final_path,
+                        thumbnail_metadata.get("thumbnail_status"),
+                        thumbnail_metadata.get("error_message"),
+                    )
 
             response = master_client.register_file(
                 content_hash=content_hash,
@@ -140,6 +172,8 @@ def create_files_blueprint(config, space_cache, master_client):
                 media_type=media_type,
                 physical_path=str(final_path),
                 location_type=location_type,
+                technical_metadata=technical_metadata,
+                thumbnail_metadata=thumbnail_metadata,
             )
 
             if response.status_code >= 400:
@@ -195,6 +229,20 @@ def create_files_blueprint(config, space_cache, master_client):
                 except Exception:
                     current_app.logger.exception("Failed to clean up unregistered shared-space file: %s", final_path)
             return jsonify({"error": str(exc)}), 500
+
+    @bp.route("/thumbnails/<content_hash>", methods=["GET"])
+    def serve_thumbnail(content_hash):
+        thumbnail_path = thumbnail_path_for_hash(content_hash)
+        if not thumbnail_path:
+            return jsonify({"error": "Invalid content hash"}), 400
+        try:
+            resolved_path = thumbnail_path.resolve()
+            resolved_path.relative_to(config.THUMBNAILS_DIR.resolve())
+        except Exception:
+            return jsonify({"error": "Invalid thumbnail path"}), 403
+        if not resolved_path.exists() or not resolved_path.is_file():
+            return jsonify({"error": "Thumbnail not found"}), 404
+        return send_file(resolved_path, mimetype="image/jpeg", conditional=True)
 
     @bp.route("/<file_id>/download", methods=["GET"])
     def download_file(file_id):
@@ -428,6 +476,28 @@ def create_files_blueprint(config, space_cache, master_client):
             trash_root = getattr(config, "TRASH_DIR", config.SHARED_SPACE_DIR.parent / "trash")
             trash_path = Path(raw_trash_path).expanduser().resolve()
 
+            def original_name_from_trash_path(path):
+                # Trash names are {file_id}-{source_name} or {file_id}-{counter}-{source_name}.
+                match = re.match(r'^' + re.escape(str(file_id)) + r'(?:-\d+)?-(.+)$', path.name)
+                return match.group(1) if match else path.name
+
+            def expected_shared_space_path(path):
+                return path_for_hash(config.SHARED_SPACE_DIR, content_hash, original_name_from_trash_path(path))
+
+            def already_restored_response(path, reason="content already exists in shared space"):
+                actual_hash = sha256_file(path)
+                if actual_hash != content_hash:
+                    return jsonify({
+                        "error": "Existing shared_space file hash mismatch",
+                        "expected": content_hash,
+                        "actual": actual_hash,
+                    }), 409
+                return jsonify({
+                    "status": "already_restored",
+                    "reason": reason,
+                    "shared_space_path": str(path),
+                }), 200
+
             def find_matching_trash_path():
                 if not trash_root.exists():
                     return None, None
@@ -464,6 +534,12 @@ def create_files_blueprint(config, space_cache, master_client):
                         "candidates": mismatches,
                     }), 409
                 else:
+                    final_path = expected_shared_space_path(trash_path)
+                    if final_path.exists() and final_path.is_file():
+                        return already_restored_response(
+                            final_path,
+                            reason="trash entry is missing but content exists in shared space",
+                        )
                     return jsonify({"status": "already_missing", "path": str(trash_path)}), 200
 
             # Safety: ensure this is inside the node's trash directory
@@ -471,13 +547,7 @@ def create_files_blueprint(config, space_cache, master_client):
                 trash_path.resolve().relative_to(trash_root.resolve())
             except Exception:
                 if is_path_inside(config.SHARED_SPACE_DIR, trash_path):
-                    actual_hash = sha256_file(trash_path)
-                    if actual_hash == content_hash:
-                        return jsonify({
-                            "status": "already_restored",
-                            "reason": "content already exists in shared space",
-                            "shared_space_path": str(trash_path),
-                        }), 200
+                    return already_restored_response(trash_path)
 
                 fallback_path, mismatches = find_matching_trash_path()
                 if fallback_path:
@@ -493,11 +563,7 @@ def create_files_blueprint(config, space_cache, master_client):
 
             # Derive original filename from trash entry. Trash names were created as:
             #   {file_id}-{source_name}  or {file_id}-{counter}-{source_name}
-            m = re.match(r'^' + re.escape(str(file_id)) + r'(?:-\d+)?-(.+)$', trash_path.name)
-            if m:
-                original_name = m.group(1)
-            else:
-                original_name = trash_path.name
+            original_name = original_name_from_trash_path(trash_path)
 
             final_path = path_for_hash(config.SHARED_SPACE_DIR, content_hash, original_name)
             final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -506,20 +572,11 @@ def create_files_blueprint(config, space_cache, master_client):
 
             if final_path.exists():
                 # Verify existing shared-space file matches expected content hash before deleting trash copy
-                actual_hash = sha256_file(final_path)
-                if actual_hash != content_hash:
-                    return jsonify({
-                        "error": "Existing shared_space file hash mismatch",
-                        "expected": content_hash,
-                        "actual": actual_hash,
-                    }), 409
-
+                response, status_code = already_restored_response(final_path)
+                if status_code != 200:
+                    return response, status_code
                 trash_path.unlink(missing_ok=True)
-                return jsonify({
-                    "status": "already_restored",
-                    "reason": "content already exists in shared space",
-                    "shared_space_path": str(final_path)
-                }), 200
+                return response, status_code
 
             shutil.move(str(trash_path), str(final_path))
 

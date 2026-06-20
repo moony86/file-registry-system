@@ -62,23 +62,131 @@ function cardTitle(item) {
     return item.collection_title || item.title || item.file_name || "Untitled";
 }
 
+function numberOrMax(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : Number.MAX_SAFE_INTEGER;
+}
+
+function itemKey(item) {
+    return String(item.media_id || item.file_id || `${item.title}-${item.season_number}-${item.episode_number}`);
+}
+
+function sortItems(items) {
+    return [...items].sort((a, b) =>
+        numberOrMax(a.season_number || a.season) - numberOrMax(b.season_number || b.season)
+        || numberOrMax(a.episode_number || a.episode || a.display_order) - numberOrMax(b.episode_number || b.episode || b.display_order)
+        || new Date(a.created_at || 0) - new Date(b.created_at || 0)
+    );
+}
+
+function collectionFromItem(item, type) {
+    const season = item.season_number || item.season || 1;
+    return {
+        collection_id: item.collection_id,
+        collection_type: item.collection_type || type,
+        title: item.collection_title || item.title || "Untitled",
+        seasons: {
+            [season]: [item],
+        },
+    };
+}
+
+function mergeCollectionList(collections) {
+    const merged = new Map();
+
+    for (const collection of collections || []) {
+        const title = collection.title || "Untitled";
+        const key = title.trim().toLowerCase();
+        if (!merged.has(key)) {
+            merged.set(key, {
+                ...collection,
+                title,
+                seasons: {},
+            });
+        }
+
+        const target = merged.get(key);
+        const currentType = target.collection_type || "unknown";
+        const incomingType = collection.collection_type || "unknown";
+        if (currentType === "unknown" && incomingType !== "unknown") {
+            target.collection_id = collection.collection_id;
+            target.collection_type = incomingType;
+        }
+
+        const seasons = collection.seasons || {};
+        for (const [seasonNumber, episodes] of Object.entries(seasons)) {
+            if (!target.seasons[seasonNumber]) target.seasons[seasonNumber] = [];
+            const seen = new Set(target.seasons[seasonNumber].map(itemKey));
+            for (const episode of episodes || []) {
+                const keyForEpisode = itemKey(episode);
+                if (seen.has(keyForEpisode)) continue;
+                seen.add(keyForEpisode);
+                target.seasons[seasonNumber].push(episode);
+            }
+        }
+    }
+
+    return Array.from(merged.values())
+        .map((collection) => {
+            const sortedSeasons = {};
+            for (const [seasonNumber, episodes] of Object.entries(collection.seasons || {})
+                .sort(([a], [b]) => numberOrMax(a) - numberOrMax(b))) {
+                sortedSeasons[seasonNumber] = sortItems(episodes);
+            }
+            return { ...collection, seasons: sortedSeasons };
+        })
+        .sort((a, b) => String(a.title || "").localeCompare(String(b.title || "")));
+}
+
+function normalizeLibrary(library) {
+    const animeFromOther = [];
+    const seriesFromOther = [];
+    const remainingOther = [];
+
+    for (const item of library.other || []) {
+        if (item.collection_type === "anime") {
+            animeFromOther.push(collectionFromItem(item, "anime"));
+        } else if (item.collection_type === "series") {
+            seriesFromOther.push(collectionFromItem(item, "series"));
+        } else {
+            remainingOther.push(item);
+        }
+    }
+
+    return {
+        ...library,
+        anime: mergeCollectionList([...(library.anime || []), ...animeFromOther]),
+        series: mergeCollectionList([...(library.series || []), ...seriesFromOther]),
+        movies: sortItems(library.movies || []),
+        youtube: sortItems(library.youtube || []),
+        shorts: sortItems(library.shorts || []),
+        courses: sortItems(library.courses || []),
+        clips: sortItems(library.clips || []),
+        other: sortItems(remainingOther),
+    };
+}
+
 function mediaCard(item) {
     const subtitleParts = [item.media_kind || "video"];
     const season = item.season_number || item.season;
     const episode = item.episode_number || item.episode;
     if (season || episode) subtitleParts.push(`S${season || ""} E${episode || ""}`);
     const canPlay = item.file_status === "ACTIVE" && item.is_available;
+    const thumbnailKind = item.media_kind || item.collection_type || "video";
+    const thumbnailUrl = item.file_id ? `${MASTER_URL}/api/files/${encodeURIComponent(item.file_id)}/thumbnail?kind=${encodeURIComponent(thumbnailKind)}` : "";
     return `
         <article class="bg-gray-900 border border-gray-800 overflow-hidden hover:border-cyan-700 transition">
-            <div class="aspect-[2/3] bg-gradient-to-br from-gray-800 to-gray-950 flex items-center justify-center">
-                <span class="text-5xl text-gray-600">PLAY</span>
+            <div class="aspect-video bg-gray-950 flex items-center justify-center overflow-hidden">
+                ${thumbnailUrl
+                    ? `<img src="${thumbnailUrl}" alt="" loading="lazy" class="w-full h-full object-cover">`
+                    : `<span class="text-5xl text-gray-600">PLAY</span>`}
             </div>
             <div class="p-4 space-y-3">
                 <div>
                     <h3 class="font-bold text-gray-100 line-clamp-2">${escapeHtml(cardTitle(item))}</h3>
                     <p class="text-xs text-gray-500 mt-1">${escapeHtml(subtitleParts.join(" | "))}</p>
                 </div>
-                <button ${canPlay ? `onclick="playVideo('${escapeJsArg(item.file_id)}', '${escapeJsArg(cardTitle(item))}')"` : "disabled"}
+                <button ${canPlay ? `onclick="openWatchPage('${escapeJsArg(item.file_id)}')"` : "disabled"}
                     class="${canPlay ? "bg-cyan-600 hover:bg-cyan-500 text-white" : "bg-gray-800 text-gray-500"} w-full py-2 text-sm font-semibold transition">
                     Play
                 </button>
@@ -90,11 +198,17 @@ function collectionCard(collection, type) {
     const seasons = collection.seasons || {};
     const episodeCount = Object.values(seasons).reduce((total, episodes) => total + (episodes || []).length, 0);
     const collectionKey = String(collection.collection_id || collection.title);
+    const firstEpisode = Object.entries(seasons)
+        .sort(([a], [b]) => numberOrMax(a) - numberOrMax(b))
+        .flatMap(([, episodes]) => episodes || [])[0];
+    const thumbnailUrl = firstEpisode?.file_id ? `${MASTER_URL}/api/files/${encodeURIComponent(firstEpisode.file_id)}/thumbnail?kind=${encodeURIComponent(type)}` : "";
     return `
         <button onclick="renderCollection('${escapeJsArg(type)}', '${escapeJsArg(collectionKey)}')"
             class="text-left bg-gray-900 border border-gray-800 hover:border-cyan-700 transition overflow-hidden">
-            <div class="aspect-video bg-gradient-to-br from-cyan-950 to-gray-950 flex items-center justify-center">
-                <span class="text-4xl text-cyan-800">FSYS</span>
+            <div class="aspect-video bg-gray-950 flex items-center justify-center overflow-hidden">
+                ${thumbnailUrl
+                    ? `<img src="${thumbnailUrl}" alt="" loading="lazy" class="w-full h-full object-cover">`
+                    : `<span class="text-4xl text-cyan-800">FSYS</span>`}
             </div>
             <div class="p-4">
                 <h3 class="font-bold text-gray-100">${escapeHtml(collection.title || "Untitled")}</h3>
@@ -204,6 +318,10 @@ function renderCollection(type, collectionKey) {
     `;
 }
 
+function openWatchPage(fileId) {
+    window.location.href = `/watch/${encodeURIComponent(fileId)}`;
+}
+
 async function playVideo(fileId, title) {
     try {
         const data = await fetchJson(`${MASTER_URL}/api/files/${fileId}/location?access_type=stream_location`);
@@ -214,6 +332,7 @@ async function playVideo(fileId, title) {
         const modal = document.getElementById("viewer-video-modal");
         const player = document.getElementById("viewer-video-player");
         document.getElementById("viewer-video-title").innerText = title || data.file_name || "Video";
+        await loadSubtitleTracks(player, fileId);
         player.src = `http://${host}:${port}/api/files/${fileId}/stream`;
         modal.classList.remove("hidden");
         player.play().catch(() => {});
@@ -222,10 +341,36 @@ async function playVideo(fileId, title) {
     }
 }
 
+async function loadSubtitleTracks(player, fileId) {
+    if (!player) return;
+    player.querySelectorAll("track").forEach((track) => track.remove());
+    try {
+        const data = await fetchJson(`${MASTER_URL}/api/media/files/${fileId}/subtitles`);
+        const playable = (data.subtitles || []).filter((subtitle) =>
+            subtitle.status === "active"
+            && subtitle.subtitle_format !== "ass"
+            && (subtitle.vtt_path || subtitle.subtitle_format === "vtt")
+        );
+        const hasDefault = playable.some((subtitle) => subtitle.is_default);
+        playable.forEach((subtitle, index) => {
+            const track = document.createElement("track");
+            track.kind = "subtitles";
+            track.src = `${MASTER_URL}/api/media/subtitles/${subtitle.subtitle_id}/file`;
+            track.srclang = subtitle.language || "unknown";
+            track.label = subtitle.label || subtitle.language || "Subtitle";
+            if (subtitle.is_default || (!hasDefault && index === 0)) track.default = true;
+            player.appendChild(track);
+        });
+    } catch (error) {
+        console.warn("Failed to load subtitles:", error);
+    }
+}
+
 function closeVideo() {
     const modal = document.getElementById("viewer-video-modal");
     const player = document.getElementById("viewer-video-player");
     player.pause();
+    player.querySelectorAll("track").forEach((track) => track.remove());
     player.removeAttribute("src");
     player.load();
     modal.classList.add("hidden");
@@ -234,7 +379,7 @@ function closeVideo() {
 async function loadViewer() {
     const content = document.getElementById("viewer-content");
     try {
-        mediaLibrary = await fetchJson(`${MASTER_URL}/api/media/library`);
+        mediaLibrary = normalizeLibrary(await fetchJson(`${MASTER_URL}/api/media/library`));
         renderSection(currentSection);
     } catch (error) {
         content.innerHTML = `<div class="text-red-400 border border-red-900/60 p-8">Could not load media library. Restart Master Node if the media API was just added.</div>`;

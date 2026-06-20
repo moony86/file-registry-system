@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, redirect, request
 import requests
 from services.auth import require_node_token
 
@@ -30,6 +30,26 @@ def create_files_blueprint(db):
                 physical_path=data["physical_path"],
                 location_type=data.get("location_type", "LOCAL"),
             )
+            technical_metadata = data.get("technical_metadata")
+            if technical_metadata:
+                try:
+                    db.upsert_technical_metadata(data["content_hash"], technical_metadata)
+                except Exception:
+                    current_app.logger.warning(
+                        "Failed to save technical metadata for content_hash=%s",
+                        data["content_hash"],
+                        exc_info=True,
+                    )
+            thumbnail_metadata = data.get("thumbnail_metadata")
+            if thumbnail_metadata:
+                try:
+                    db.upsert_thumbnail_metadata(data["content_hash"], thumbnail_metadata)
+                except Exception:
+                    current_app.logger.warning(
+                        "Failed to save thumbnail metadata for content_hash=%s",
+                        data["content_hash"],
+                        exc_info=True,
+                    )
             return jsonify({
                 "status": "registered",
                 "file_id": str(file_id),
@@ -105,6 +125,8 @@ def create_files_blueprint(db):
             return jsonify({"error": "File not found"}), 404
 
         first = locations[0]
+        technical_metadata = db.get_technical_metadata(first["content_hash"])
+        thumbnail_metadata = db.get_thumbnail_metadata(first["content_hash"])
         return jsonify({
             "file_id": str(file_id),
             "file_name": first["file_name"],
@@ -117,6 +139,9 @@ def create_files_blueprint(db):
             "content_hash": first["content_hash"],
             "popularity_score": first["popularity_score"],
             "is_hot": first.get("is_hot", 0),
+            "technical_metadata": technical_metadata,
+            "thumbnail": thumbnail_metadata,
+            "thumbnail_url": f"/api/files/{file_id}/thumbnail",
             "locations": [
                 {
                     "node_id": loc["node_id"],
@@ -132,6 +157,42 @@ def create_files_blueprint(db):
                 for loc in locations if loc.get("node_id")
             ],
         }), 200
+
+    def placeholder_svg(media_type="video"):
+        label = {
+            "movie": "MOVIE",
+            "series": "SERIES",
+            "anime": "ANIME",
+            "video": "VIDEO",
+        }.get(media_type or "video", "VIDEO")
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <rect width="640" height="360" fill="#111827"/>
+  <rect x="24" y="24" width="592" height="312" fill="#1f2937" stroke="#374151" stroke-width="2"/>
+  <circle cx="320" cy="168" r="48" fill="#0891b2" opacity="0.85"/>
+  <polygon points="305,140 305,196 352,168" fill="#ecfeff"/>
+  <text x="320" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#d1d5db">{label}</text>
+</svg>"""
+        return Response(svg, mimetype="image/svg+xml")
+
+    @bp.route("/files/<file_id>/thumbnail", methods=["GET"])
+    def get_file_thumbnail(file_id):
+        locations = db.get_file_locations(file_id)
+        if not locations:
+            locations = db.get_locations_for_file(file_id)
+        if not locations:
+            return placeholder_svg("video")
+
+        first = locations[0]
+        thumbnail = db.get_thumbnail_metadata(first["content_hash"])
+        if thumbnail and thumbnail.get("thumbnail_status") == "success":
+            for loc in locations:
+                if loc.get("host") and loc.get("port") and loc.get("node_status") == "ONLINE":
+                    return redirect(
+                        f"http://{loc['host']}:{loc['port']}/api/files/thumbnails/{first['content_hash']}",
+                        code=302,
+                    )
+
+        return placeholder_svg(request.args.get("kind") or first.get("media_type", "video"))
 
     @bp.route("/files", methods=["GET"])
     def list_all_files():

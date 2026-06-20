@@ -1,10 +1,38 @@
-from flask import Blueprint, jsonify, request
+import re
+import time
+from pathlib import Path
+
+from flask import Blueprint, jsonify, request, send_file
+from werkzeug.utils import secure_filename
 
 
 def _optional_int(value):
     if value in (None, ""):
         return None
     return int(value)
+
+
+SUBTITLES_ROOT = Path(__file__).resolve().parents[1] / "subtitles"
+SUPPORTED_SUBTITLE_FORMATS = {"srt", "vtt", "ass"}
+
+
+def _subtitle_format(filename):
+    suffix = Path(filename or "").suffix.lower().lstrip(".")
+    return suffix if suffix in SUPPORTED_SUBTITLE_FORMATS else "unknown"
+
+
+def _bool_form(value):
+    return str(value or "").lower() in {"1", "true", "yes", "on"}
+
+
+def convert_srt_to_vtt(srt_path, vtt_path):
+    text = Path(srt_path).read_text(encoding="utf-8-sig", errors="replace")
+    text = re.sub(
+        r"(\d{2}:\d{2}:\d{2}),(\d{3})",
+        r"\1.\2",
+        text,
+    )
+    Path(vtt_path).write_text("WEBVTT\n\n" + text.strip() + "\n", encoding="utf-8")
 
 
 def create_media_blueprint(db):
@@ -31,6 +59,19 @@ def create_media_blueprint(db):
             return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
+
+    @bp.route("/collections/<int:collection_id>", methods=["DELETE"])
+    def delete_collection(collection_id):
+        try:
+            result = db.delete_media_collection(collection_id)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+        if result.get("status") == "not_found":
+            return jsonify(result), 404
+        if result.get("status") == "not_empty":
+            return jsonify(result), 409
+        return jsonify(result), 200
 
     @bp.route("/library", methods=["GET"])
     def get_library():
@@ -144,6 +185,13 @@ def create_media_blueprint(db):
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
+    @bp.route("/files/<file_id>/neighbors", methods=["GET"])
+    def get_media_neighbors(file_id):
+        try:
+            return jsonify(db.get_media_neighbors(file_id)), 200
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
     @bp.route("/files/<file_id>", methods=["PATCH"])
     def update_media_for_file(file_id):
         data = request.get_json(force=True) or {}
@@ -170,5 +218,114 @@ def create_media_blueprint(db):
             return jsonify({"error": "Media item not found for file", "file_id": file_id}), 404
 
         return jsonify({"status": "saved", **db.get_media_for_file(file_id)}), 200
+
+    @bp.route("/files/<file_id>/subtitles", methods=["GET"])
+    def list_file_subtitles(file_id):
+        try:
+            tracks = db.list_subtitle_tracks(file_id)
+            return jsonify({"count": len(tracks), "subtitles": tracks}), 200
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @bp.route("/files/<file_id>/subtitles", methods=["POST"])
+    def upload_file_subtitle(file_id):
+        if "file" not in request.files:
+            return jsonify({"error": "Missing subtitle file"}), 400
+
+        content_hash = db.get_file_content_hash(file_id)
+        if not content_hash:
+            return jsonify({"error": "Video file not found", "file_id": file_id}), 404
+
+        upload = request.files["file"]
+        original_name = Path(upload.filename or "subtitle").name
+        subtitle_format = _subtitle_format(original_name)
+        if subtitle_format == "unknown":
+            return jsonify({"error": "Unsupported subtitle format", "allowed": sorted(SUPPORTED_SUBTITLE_FORMATS)}), 400
+
+        safe_name = secure_filename(original_name) or f"subtitle.{subtitle_format}"
+        target_dir = SUBTITLES_ROOT / str(file_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored_name = f"{int(time.time() * 1000)}-{safe_name}"
+        storage_path = target_dir / stored_name
+        upload.save(storage_path)
+
+        vtt_path = None
+        if subtitle_format == "srt":
+            vtt_path = storage_path.with_suffix(".vtt")
+            try:
+                convert_srt_to_vtt(storage_path, vtt_path)
+            except Exception as exc:
+                vtt_path = None
+                # Keep the original subtitle even when browser-ready conversion fails.
+                label = request.form.get("label") or request.form.get("language") or "Unknown"
+                subtitle_id = db.create_subtitle_track(
+                    file_id=file_id,
+                    content_hash=content_hash,
+                    subtitle_file_name=original_name,
+                    subtitle_format=subtitle_format,
+                    language=request.form.get("language", "unknown"),
+                    label=label,
+                    is_default=_bool_form(request.form.get("is_default")),
+                    storage_path=str(storage_path),
+                    vtt_path=None,
+                )
+                track = db.get_subtitle_track(subtitle_id)
+                return jsonify({
+                    "status": "stored",
+                    "warning": f"SRT to VTT conversion failed: {exc}",
+                    "subtitle": track,
+                }), 201
+
+        label = request.form.get("label") or request.form.get("language") or "Unknown"
+        subtitle_id = db.create_subtitle_track(
+            file_id=file_id,
+            content_hash=content_hash,
+            subtitle_file_name=original_name,
+            subtitle_format=subtitle_format,
+            language=request.form.get("language", "unknown"),
+            label=label,
+            is_default=_bool_form(request.form.get("is_default")),
+            storage_path=str(storage_path),
+            vtt_path=str(vtt_path) if vtt_path else None,
+        )
+        return jsonify({"status": "created", "subtitle": db.get_subtitle_track(subtitle_id)}), 201
+
+    @bp.route("/subtitles/<int:subtitle_id>", methods=["DELETE"])
+    def delete_subtitle(subtitle_id):
+        ok = db.soft_delete_subtitle_track(subtitle_id)
+        if not ok:
+            return jsonify({"error": "Subtitle not found or already deleted", "subtitle_id": subtitle_id}), 404
+        return jsonify({"status": "deleted", "subtitle_id": subtitle_id}), 200
+
+    @bp.route("/subtitles/<int:subtitle_id>/default", methods=["PATCH"])
+    def set_default_subtitle(subtitle_id):
+        ok = db.set_default_subtitle_track(subtitle_id)
+        if not ok:
+            return jsonify({"error": "Active subtitle not found", "subtitle_id": subtitle_id}), 404
+        return jsonify({"status": "default_set", "subtitle": db.get_subtitle_track(subtitle_id)}), 200
+
+    @bp.route("/subtitles/<int:subtitle_id>/file", methods=["GET"])
+    def get_subtitle_file(subtitle_id):
+        track = db.get_subtitle_track(subtitle_id)
+        if not track or track.get("status") != "active":
+            return jsonify({"error": "Subtitle not found"}), 404
+
+        if track.get("subtitle_format") == "ass":
+            return jsonify({"error": "ASS subtitles are stored only and unsupported by the browser player"}), 415
+
+        path = track.get("vtt_path") or track.get("storage_path")
+        if not path:
+            return jsonify({"error": "No playable subtitle file available"}), 404
+
+        subtitle_path = Path(path).resolve()
+        try:
+            subtitle_path.relative_to(SUBTITLES_ROOT.resolve())
+        except Exception:
+            return jsonify({"error": "Invalid subtitle path"}), 403
+        if not subtitle_path.exists() or not subtitle_path.is_file():
+            return jsonify({"error": "Subtitle file missing"}), 404
+
+        mimetype = "text/vtt" if subtitle_path.suffix.lower() == ".vtt" else "text/plain"
+        return send_file(subtitle_path, mimetype=mimetype, conditional=True)
 
     return bp

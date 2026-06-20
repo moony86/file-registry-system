@@ -79,20 +79,28 @@ class MasterClient:
         media_type: str,
         physical_path: str,
         location_type: str,
+        technical_metadata: dict | None = None,
+        thumbnail_metadata: dict | None = None,
     ):
+        payload = {
+            "content_hash": content_hash,
+            "file_name": file_name,
+            "owner": owner,
+            "size_bytes": size_bytes,
+            "mime_type": mime_type,
+            "media_type": media_type,
+            "node_id": self.node_id,
+            "physical_path": physical_path,
+            "location_type": location_type,
+        }
+        if technical_metadata is not None:
+            payload["technical_metadata"] = technical_metadata
+        if thumbnail_metadata is not None:
+            payload["thumbnail_metadata"] = thumbnail_metadata
+
         return requests.post(
             f"{self.master_url}/api/files/register",
-            json={
-                "content_hash": content_hash,
-                "file_name": file_name,
-                "owner": owner,
-                "size_bytes": size_bytes,
-                "mime_type": mime_type,
-                "media_type": media_type,
-                "node_id": self.node_id,
-                "physical_path": physical_path,
-                "location_type": location_type,
-            },
+            json=payload,
             headers=self.auth_headers(),
             timeout=10,
         )

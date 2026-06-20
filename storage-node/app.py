@@ -14,6 +14,7 @@ from services.space_cache import SpaceCache
 
 def create_app():
     config.SHARED_SPACE_DIR.mkdir(parents=True, exist_ok=True)
+    config.THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
 
     app = Flask(__name__)
     CORS(app, origins=config.CORS_ORIGINS)
