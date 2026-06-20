@@ -1,8 +1,14 @@
 import logging
+import sys
 from pathlib import Path
 
 from flask import Flask
 from flask_cors import CORS
+
+from services.setup_wizard import maybe_run_setup_wizard
+
+maybe_run_setup_wizard()
+sys.argv = [arg for arg in sys.argv if arg not in {"--setup", "--reset-config"}]
 
 import config
 from routes.debug import create_debug_blueprint

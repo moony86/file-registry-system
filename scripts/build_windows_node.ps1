@@ -9,12 +9,17 @@ $PackageDir = Join-Path $RepoRoot "dist\FSYSNode"
 $PyInstallerDist = Join-Path $RepoRoot "dist\_pyinstaller_node"
 $PyInstallerWork = Join-Path $RepoRoot "build\pyinstaller-node"
 $StorageApp = Join-Path $RepoRoot "storage-node\app.py"
+$NodeControl = Join-Path $RepoRoot "storage-node\node_control.py"
 $StoragePath = Join-Path $RepoRoot "storage-node"
 
 Write-Host "Building FSYS Windows Storage Node package..."
 
 if (Test-Path $PackageDir) {
-    Remove-Item -LiteralPath $PackageDir -Recurse -Force
+    try {
+        Remove-Item -LiteralPath $PackageDir -Recurse -Force
+    } catch {
+        throw "Could not clean $PackageDir. Close any running FSYS node from this folder, then rerun the build. Original error: $($_.Exception.Message)"
+    }
 }
 if (Test-Path $PyInstallerDist) {
     Remove-Item -LiteralPath $PyInstallerDist -Recurse -Force
@@ -49,9 +54,24 @@ New-Item -ItemType Directory -Force -Path $PyInstallerWork | Out-Null
     --hidden-import services.media `
     --hidden-import services.probe `
     --hidden-import services.registration `
+    --hidden-import services.setup_wizard `
     --hidden-import services.space_cache `
     --hidden-import services.thumbnails `
     $StorageApp
+
+& $Python -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onedir `
+    --windowed `
+    --name "FSYS Node" `
+    --distpath $PyInstallerDist `
+    --workpath $PyInstallerWork `
+    --specpath $PyInstallerWork `
+    --paths $StoragePath `
+    --hidden-import tkinter `
+    --hidden-import tkinter.messagebox `
+    $NodeControl
 
 $BuiltDir = Join-Path $PyInstallerDist "fsys-node"
 if (!(Test-Path $BuiltDir)) {
@@ -59,6 +79,13 @@ if (!(Test-Path $BuiltDir)) {
 }
 
 Copy-Item -Path (Join-Path $BuiltDir "*") -Destination $PackageDir -Recurse -Force
+
+$ControlBuiltDir = Join-Path $PyInstallerDist "FSYS Node"
+if (!(Test-Path $ControlBuiltDir)) {
+    throw "PyInstaller output not found: $ControlBuiltDir"
+}
+
+Copy-Item -Path (Join-Path $ControlBuiltDir "*") -Destination $PackageDir -Recurse -Force
 
 foreach ($dir in @("data", "shared_space", "thumbnails", "logs")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $PackageDir $dir) | Out-Null
@@ -86,13 +113,16 @@ pause
 @'
 # FSYS Windows Storage Node
 
-1. Edit `.env` after first run, or copy `.env.example` to `.env` manually.
-2. Set `MASTER_URLS` to your Master Node addresses.
-3. Set `LOCAL_LIBRARY_DIRS` to folders this node may browse, separated by commas.
-4. Run `start_node.bat`.
-5. Run `check_status.bat` to verify `/api/status`.
+1. Run `FSYS Node.exe`.
+2. Click `Start Node`.
+3. Click `Open Local Status` to verify `/api/status`.
+4. Click `Setup / Reconfigure` if you need to change Master URLs, local libraries, or token.
 
-The first run creates `.env` from `.env.example` if `.env` is missing.
+Advanced:
+- `fsys-node.exe --setup` always opens the setup wizard.
+- `fsys-node.exe --reset-config` renames `.env` to `.env.old`, then opens the setup wizard.
+- You can still edit `.env` manually later.
+- `start_node.bat` and `check_status.bat` are fallback troubleshooting scripts.
 
 Runtime folders:
 - `data/` stable node identity
@@ -100,7 +130,7 @@ Runtime folders:
 - `thumbnails/` generated thumbnails
 - `logs/` `node.log`
 
-Windows Service, setup wizard, auto update, and signed installer are planned later.
+Windows Service, auto update, and signed installer are planned later.
 '@ | Set-Content -Path (Join-Path $PackageDir "README_NODE_WINDOWS.md") -Encoding UTF8
 
 if (Test-Path $PyInstallerDist) {

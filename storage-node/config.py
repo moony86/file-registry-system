@@ -3,7 +3,6 @@ import re
 import uuid
 import socket
 import json
-import shutil
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -14,22 +13,6 @@ RUNTIME_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path.cwd()
 
 if IS_FROZEN:
     os.chdir(RUNTIME_DIR)
-
-
-def ensure_portable_env_file():
-    if not IS_FROZEN:
-        return
-
-    env_path = RUNTIME_DIR / ".env"
-    example_path = RUNTIME_DIR / ".env.example"
-    if env_path.exists() or not example_path.exists():
-        return
-
-    shutil.copyfile(example_path, env_path)
-    print("Created .env from .env.example. Please edit MASTER_URLS and LOCAL_LIBRARY_DIRS if needed.")
-
-
-ensure_portable_env_file()
 load_dotenv()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()

@@ -32,6 +32,7 @@ def create_files_blueprint(config, space_cache, master_client):
 
     @bp.route("/register", methods=["POST"])
     def register_local_file():
+        """Deprecated compatibility endpoint. Prefer POST /api/files/register-local."""
         if not require_node_token():
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -59,7 +60,13 @@ def create_files_blueprint(config, space_cache, master_client):
                 physical_path=str(source_path),
                 location_type="LOCAL",
             )
-            return response.json(), response.status_code
+            payload = response.json()
+            payload["deprecated"] = True
+            payload["replacement"] = "/api/files/register-local"
+            result = jsonify(payload)
+            result.headers["X-FSYS-Deprecated"] = "true"
+            result.headers["X-FSYS-Replacement"] = "/api/files/register-local"
+            return result, response.status_code
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 404
         except Exception as exc:

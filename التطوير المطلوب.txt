@@ -1,228 +1,268 @@
-FSYS v0.8.3 – Windows Portable Node Package
+FSYS v0.8.5 – Windows User-Friendly Node App + Cleanup
 
 الهدف:
-تجهيز Storage Node كحزمة Portable على Windows، تعمل بدون VS Code وبدون خطوات كثيرة.
+تحويل FSYS Storage Node على Windows من تجربة مطور/CLI إلى تجربة مستخدم بسيطة قدر الإمكان، مع تنظيف التكرار والكود القديم غير المستخدم.
 
 السياق:
-v0.8.2 يدعم:
+v0.8.x الحالي يدعم:
+- Windows portable package
+- first-run setup wizard
+- auto identity
+- auto host
+- MASTER_URLS fallback
+- background registration
 - LOCAL register
 - Browse Local Library
 - CACHED upload
-- Promote LOCAL→CACHED via operation queue
-- runtime hardening
-- master fallback
-- auto identity
+- promote LOCAL→CACHED via operations queue
+- status endpoint
+
+المشكلة:
+التجربة ما زالت تبدو مختبر:
+- شاشة سوداء
+- PowerShell
+- .env يدوي
+- bat files
+- endpoints قديمة
+- صعوبة على مستخدم عادي
+
+المطلوب:
+1. تنظيف آمن للكود القديم/المكرر.
+2. تقليل الإعداد اليدوي.
+3. إضافة واجهة Windows بسيطة للنود.
+4. جعل التشغيل أقرب إلى “برنامج” وليس سكربت.
 
 ممنوع:
-- لا تضف Windows Service الآن.
 - لا تضف HOT.
 - لا تضف replication.
-- لا تعيد كتابة Go.
-- لا تغير Upload/Stream/Media.
+- لا تغير Master/Media/Stream.
 - لا تكسر تشغيل Python الحالي.
+- لا تحذف code بدون إثبات أنه غير مستخدم.
+- لا تعيد كتابة Go.
+- لا تستخدم حلول ضخمة مثل Electron.
 
 ==================================================
-1) Build Script
+المرحلة 1: Audit + Cleanup Plan
 ==================================================
 
-أضف سكربت:
+قبل أي حذف:
+افحص:
 
-scripts/build_windows_node.ps1
+storage-node/app.py
+storage-node/config.py
+storage-node/routes/files.py
+storage-node/routes/status.py
+storage-node/services/*
+scripts/*
+docs/*
+master-node/routes/files.py
+master-node/static/js/dashboard.js
+master-node/templates/dashboard.html
 
-يقوم بـ:
-- تنظيف dist القديم الخاص بالنود فقط.
-- تشغيل PyInstaller بـ onedir.
-- إخراج الحزمة في:
-  dist/FSYSNode/
+أعطني تقرير:
+- endpoints مكررة أو قديمة
+- functions غير مستخدمة
+- ملفات قديمة أو debug فقط
+- bat/scripts مكررة
+- أي شيء متتبع في git وهو runtime
+- مخاطر الحذف
 
-المطلوب داخل الحزمة:
-- fsys-node.exe
-- start_node.bat
-- check_status.bat
-- .env.example
-- README_NODE_WINDOWS.md
-- مجلدات فارغة:
+لا تحذف مباشرة إلا الأشياء الواضحة جداً مثل:
+- ملفات temp
+- ملفات runtime tracked
+- سكربتات build مكررة مثبت أنها غير مستخدمة
+
+==================================================
+المرحلة 2: Deprecate بدل Delete
+==================================================
+
+إذا وجدت endpoint قديم مثل:
+POST /api/files/register
+
+لا تحذفه فوراً إذا قد يكون مستخدم داخلياً.
+اجعله:
+- محمي token
+- موثق deprecated
+- يرجع header أو field:
+  "deprecated": true
+- أو أعد توجيه المنطق إلى register-local داخلياً إن كان آمناً.
+
+القاعدة:
+لا تكسر compatibility بدون سبب.
+
+==================================================
+المرحلة 3: Windows Node Control UI
+==================================================
+
+أضف واجهة بسيطة جداً للنود على Windows بدون Electron.
+
+الخيار المفضل:
+Tkinter لأنه مدمج مع Python غالباً.
+
+ملف جديد:
+storage-node/node_control.py
+
+الواجهة تعرض:
+- Node status
+- Master connection
+- active_master_url
+- node_id
+- node_host:node_port
+- shared space used/free
+- Local libraries
+- أزرار:
+  Start Node
+  Stop Node
+  Restart Node
+  Open Dashboard
+  Open Local Status
+  Open Logs
+  Setup / Reconfigure
+
+مهم:
+لا تجعل UI نفسها هي Flask server.
+الواجهة تكون launcher/controller:
+- تشغل fsys-node.exe أو python app.py كـ subprocess
+- تراقب health عبر /api/status
+- تعرض logs مختصرة
+
+إذا التحكم بـ Stop صعب:
+ابدأ بـ Start + Open Dashboard + Open Status + Open Logs + Setup.
+Stop/Restart optional.
+
+==================================================
+المرحلة 4: Setup UX
+==================================================
+
+بدلاً من Wizard نصي فقط:
+أضف خيار setup من الواجهة:
+- Master URLS
+- Token
+- Shared Space Folder
+- Storage Limit
+- Local Libraries
+
+إذا GUI setup ثقيل الآن:
+أبقِ CLI wizard لكن أضف زر:
+Setup / Reconfigure
+يفتح:
+fsys-node.exe --setup
+في نافذة منفصلة.
+
+المهم:
+المستخدم لا يحتاج يفتح PowerShell بنفسه.
+
+==================================================
+المرحلة 5: Auto defaults
+==================================================
+
+حسّن Zero-config قدر الإمكان:
+
+إذا .env غير موجود:
+- أنشئ .env تلقائياً من defaults.
+- NODE_ID=auto
+- NODE_HOST=auto
+- DATA_DIR=./data
+- SHARED_SPACE_DIR=./shared_space
+- THUMBNAILS_DIR=./thumbnails
+- LOCAL_LIBRARY_DIRS الافتراضي:
+  Windows Videos folder إن أمكن:
+  C:/Users/<user>/Videos
+  C:/Users/<user>/Downloads
+  إن وجدت.
+- MASTER_URLS:
+  حاول اكتشاف master من:
+  1. قيمة محفوظة
+  2. localhost
+  3. IP gateway subnet scan اختياري وخفيف فقط إذا آمن
+لا تعمل scan ثقيل.
+
+إذا لا يوجد Master:
+- النود يشتغل
+- الواجهة تقول:
+  Waiting for master...
+- وتسمح للمستخدم بإدخال Master URL.
+
+==================================================
+المرحلة 6: Windows Package
+==================================================
+
+عدّل build script ليخرج:
+
+dist/FSYSNode/
+  FSYS Node.exe أو fsys-node-control.exe
+  fsys-node.exe
+  .env.example
   data/
   shared_space/
   thumbnails/
   logs/
+  start_node.bat
+  README_NODE_WINDOWS.md
 
-لا تضع ملفات runtime حقيقية داخل Git.
+المستخدم العادي يشغل:
+FSYS Node.exe
 
-==================================================
-2) PyInstaller
-==================================================
-
-استخدم onedir وليس onefile.
-
-السبب:
-- أسهل في debug.
-- أسهل مع ملفات config.
-- أفضل كبداية.
-
-تأكد من hidden imports إذا احتجت:
-- flask
-- flask_cors
-- requests
-- dotenv
-- pg8000 إن كان مطلوباً للنود فقط لا تضفه إذا ليس مطلوباً
-- services.*
-- routes.*
-
-لا تضف master-node داخل package.
+وليس:
+start_node.bat
 
 ==================================================
-3) Portable config
+المرحلة 7: Logging
 ==================================================
 
-داخل package:
+تأكد:
+- logs/node.log موجود
+- UI يقدر يفتح ملف اللوق
+- الأخطاء المهمة تظهر للمستخدم بلغة بسيطة:
+  Master unreachable
+  Firewall may block port 5001
+  Shared space full
+  Local library path invalid
 
-.env.example
-
-يحتوي:
-
-NODE_ID=auto
-NODE_HOST=auto
-NODE_PORT=5001
-
-MASTER_URLS=http://192.168.1.14:5000,http://localhost:5000
-FSYS_NODE_TOKEN=dev-token
-
-SHARED_SPACE_ENABLED=true
-SHARED_SPACE_DIR=./shared_space
-SHARED_SPACE_LIMIT_BYTES=21474836480
-
-THUMBNAILS_DIR=./thumbnails
-DATA_DIR=./data
-
-LOCAL_LIBRARY_DIRS=
-
-FSYS_CORS_ORIGINS=http://192.168.1.14:5000,http://localhost:5000,http://127.0.0.1:5000
+لا تعرض stacktrace للمستخدم العادي إلا في logs.
 
 ==================================================
-4) First run behavior
+المرحلة 8: Firewall Guidance
 ==================================================
 
-إذا .env غير موجود بجانب exe:
-- انسخ .env.example إلى .env
-- لا تسأل المستخدم الآن.
-- اطبع رسالة واضحة:
-  Created .env from .env.example. Please edit MASTER_URLS and LOCAL_LIBRARY_DIRS if needed.
+لا تحاول تعديل Windows Firewall تلقائياً الآن.
 
-هذا يجعل التشغيل الأول لا ينهار.
-
-==================================================
-5) start_node.bat
-==================================================
-
-ينفذ:
-
-fsys-node.exe
-
-ويترك النافذة مفتوحة حتى يقرأ المستخدم الأخطاء.
-
-مثال:
-@echo off
-cd /d "%~dp0"
-fsys-node.exe
-pause
+لكن:
+- إذا /api/status يعمل محلياً والنود مسجل لكن لا يمكن الوصول من جهاز آخر، اعرض نص:
+  Open TCP port 5001 in Windows Firewall.
+- أضف docs مختصرة.
 
 ==================================================
-6) check_status.bat
+المرحلة 9: Acceptance Tests
 ==================================================
 
-ينفذ:
+A) Clean audit:
+- أعطني ما أزلته وما أبقيته ولماذا.
 
-curl http://127.0.0.1:5001/api/status
+B) Python run:
+- تشغيل python storage-node/app.py ما زال يعمل.
 
-أو PowerShell Invoke-WebRequest إذا curl غير متاح.
+C) Control UI:
+- تشغيل node_control.py يفتح نافذة.
+- زر Start يشغل النود.
+- Open Status يفتح http://127.0.0.1:5001/api/status.
+- Open Dashboard يفتح active master أو configured master.
 
-==================================================
-7) Logging
-==================================================
-
-أضف logging أساسي إن لم يكن موجوداً:
-- logs/node.log
-- لا تكسر current console output.
-- يكفي logging.basicConfig في app.py أو helper بسيط.
-
-لا تبالغ.
-
-==================================================
-8) Path safety
-==================================================
-
-تأكد أن config paths النسبية:
-./shared_space
-./thumbnails
-./data
-./logs
-
-تُحل بالنسبة لمجلد التشغيل الحالي بجانب exe.
-
-مهم جداً:
-عند تشغيل exe من dist/FSYSNode، لا تجعل shared_space يتولد داخل System32 أو مكان غريب.
-
-==================================================
-9) Documentation
-==================================================
-
-أضف:
-
-docs/WINDOWS_NODE_PACKAGE.md
-
-يشرح:
-- كيف تبني الحزمة.
-- أين تجد dist/FSYSNode.
-- كيف تعدل .env.
-- كيف تشغل start_node.bat.
-- كيف تختبر check_status.bat.
-- كيف تفتح Firewall للبورت 5001.
-- أن Windows Service مؤجل.
-
-==================================================
-10) Acceptance Tests
-==================================================
-
-بعد التنفيذ:
-
-A) Build:
-- شغل scripts/build_windows_node.ps1
-- تأكد dist/FSYSNode موجود.
-
-B) Files:
-داخل dist/FSYSNode يجب وجود:
-- fsys-node.exe
-- .env.example
-- start_node.bat
-- check_status.bat
-- README_NODE_WINDOWS.md
-- data/
-- shared_space/
-- thumbnails/
-- logs/
-
-C) First run:
-- احذف .env من dist/FSYSNode.
-- شغل start_node.bat.
-- يجب أن ينشئ .env.
+D) First run:
+- احذف .env.
+- شغل UI.
 - لا ينهار.
+- ينشئ config أو يطلب setup بشكل مفهوم.
 
-D) Status:
-- check_status.bat يرجع /api/status.
+E) Package:
+- build script يخرج dist/FSYSNode.
+- المستخدم يشغل FSYS Node.exe.
+- لا يحتاج PowerShell.
 
-E) Master fallback:
-- ضع MASTER_URLS برابط أول فاشل وثاني صحيح.
-- شغل النود.
-- active_master_url ينتقل للرابط الصحيح.
-
-F) Upload:
-- جرّب Upload صغير من dashboard.
-- CACHED يعمل.
-
-G) Local:
-- ضع LOCAL_LIBRARY_DIRS في .env.
-- جرّب Browse/Add Local.
+F) Existing features:
+- Upload CACHED يعمل.
+- Browse/Add LOCAL يعمل.
+- Promote LOCAL→CACHED يعمل.
 - Play يعمل.
 
 ==================================================
@@ -230,15 +270,18 @@ Output المطلوب
 ==================================================
 
 بعد التنفيذ أعطني:
-1. الملفات الجديدة والمعدلة.
-2. كيف أبني الحزمة.
-3. شكل dist/FSYSNode.
-4. هل .env auto-created يعمل.
-5. كيف أختبر status.
-6. هل احتجت hidden imports.
-7. أي مشاكل PyInstaller ظهرت.
-8. TODO مؤجل:
+1. تقرير Cleanup.
+2. ما حذفته وما أبقيته.
+3. الملفات الجديدة والمعدلة.
+4. كيف أشغل واجهة النود.
+5. كيف أبني الحزمة.
+6. شكل dist/FSYSNode النهائي.
+7. ما الذي صار zero-config فعلاً.
+8. ما الذي لا يزال يحتاج Setup.
+9. نتائج الاختبارات.
+10. TODO مؤجل:
    - Windows Service
-   - Setup Wizard
-   - Auto update
-   - Signed installer
+   - GUI setup كامل
+   - installer signed
+   - auto update
+   - HOT/server storage
